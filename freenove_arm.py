@@ -108,6 +108,11 @@ class FreenoveArmClient:
     def wait(self, seconds: float) -> None:
         time.sleep(seconds)
 
+    def send_raw(self, text: str) -> None:
+        """Send a raw protocol line, e.g. ``S9 I1 A90``."""
+
+        self._send(text.strip())
+
     # Utility commands mirroring the official control table ----------------
     def return_to_sensor_point(self, index: int = 0) -> None:
         """Return the arm to its magnetic/sensor origin (``S10 F{index}``)."""
@@ -144,6 +149,17 @@ class FreenoveArmClient:
         """Configure microstep resolution via ``S7 W..``."""
 
         self._send(f"{self._cmd.CUSTOM_ACTION}7 {self._cmd.ARM_MSX}{resolution}")
+
+    def set_servo(self, index: int, angle: float) -> None:
+        """Set servo angle via ``S9 I{index} A{angle}``."""
+
+        safe_index = max(0, min(4, int(index)))
+        safe_angle = max(0, min(180, int(round(angle))))
+        self._send(
+            f"{self._cmd.CUSTOM_ACTION}9 "
+            f"{self._cmd.ARM_SERVO_INDEX}{safe_index} "
+            f"{self._cmd.ARM_SERVO_ANGLE}{safe_angle}"
+        )
 
     def beep(self, frequency_hz: int) -> None:
         """Play a buzzer tone (``S2 D..``)."""

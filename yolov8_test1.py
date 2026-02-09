@@ -31,6 +31,9 @@ from ultralytics import YOLO
 from Hand_Eye_Calibration import HomographyResult
 from freenove_arm import FreenoveArmClient
 
+GRIPPER_SERVO_INDEX = 1
+GRIPPER_OPEN_ANGLE = 90
+
 
 # --------------------------------------------------------------------------- #
 # Utility helpers
@@ -73,7 +76,8 @@ def robot_worker(
     done_flag: threading.Event,
 ) -> None:
     """
-    Blocking loop that consumes targets from the queue and drives the robot.
+    Finite-state machine worker: consumes one target at a time and executes
+    the move/gripper sequence without long blocking sleeps.
     Each target is a tuple (x_mm, y_mm, z_mm, cls_id).
     """
     try:
@@ -91,25 +95,162 @@ def robot_worker(
                 arm.set_ground_clearance(args.ground_clearance)
                 arm.wait(0.1)
             print("[robot] connected to arm")
-            calib_point = (args.calib_x, args.calib_y, args.calib_z)
+            home_point = (args.home_x, args.home_y, args.home_z)
+            drop_point = (args.drop_x, args.drop_y, args.drop_z)
+            state = "IDLE"
+            command_sent = False
+            start_time = 0.0
+            current_target = None  # (x, y, z, cls_id)
+            tick = 0.02  # 20ms tick
+
             while True:
-                item = target_queue.get()
-                if item is None:
-                    break
+                now = time.time()
 
-                x, y, z, cls_id = item
-                print(f"[robot] target ({x:.1f}, {y:.1f}, {z:.1f}) cls={cls_id}")
+                if state == "IDLE":
+                    # blocking wait for next target
+                    try:
+                        item = target_queue.get(timeout=tick)
+                    except queue.Empty:
+                        continue
+                    if item is None:
+                        break
+                    current_target = item
+                    busy_flag.set()
+                    done_flag.clear()
+                    state = "MOVE_TO_TARGET"
+                    command_sent = False
+                    start_time = 0.0
+                    continue
 
-                # Sequential motion: wait after each move command.
-                arm.move_to(x, y, z, speed=args.speed)
-                arm.wait(args.move_wait)
-                arm.wait(args.hold_time)
-                arm.move_to(*calib_point, speed=args.speed)
-                arm.wait(args.move_wait)
-                arm.wait(args.settle)
+                x, y, z, cls_id = current_target  # type: ignore[misc]
 
-                busy_flag.clear()
-                done_flag.set()
+                if state == "MOVE_TO_TARGET":
+                    if not command_sent:
+                        print(f"[robot] step=move_to_target wait_at_target={args.wait_at_target:.1f}s")
+                        arm.move_to(x, y, z, speed=args.speed)
+                        start_time = now
+                        command_sent = True
+                    if now - start_time >= args.move_wait:
+                        state = "WAIT_TARGET"
+                        command_sent = False
+                        start_time = now
+                    arm.wait(tick)
+                    continue
+
+                if state == "WAIT_TARGET":
+                    if now - start_time >= args.wait_at_target:
+                        state = "GRIPPER_OPEN"
+                        command_sent = False
+                        start_time = 0.0
+                    arm.wait(tick)
+                    continue
+
+                if state == "GRIPPER_OPEN":
+                    if not command_sent:
+                        print(f"[robot] step=gripper_open wait_after_open={args.wait_after_open:.1f}s")
+                        arm.set_servo(GRIPPER_SERVO_INDEX, GRIPPER_OPEN_ANGLE)
+                        start_time = now
+                        command_sent = True
+                    if now - start_time >= args.gripper_wait:
+                        state = "WAIT_OPEN"
+                        start_time = now
+                        command_sent = False
+                    arm.wait(tick)
+                    continue
+
+                if state == "WAIT_OPEN":
+                    if now - start_time >= args.wait_after_open:
+                        state = "GRIPPER_CLOSE"
+                        command_sent = False
+                        start_time = 0.0
+                    arm.wait(tick)
+                    continue
+
+                if state == "GRIPPER_CLOSE":
+                    if not command_sent:
+                        print(f"[robot] step=gripper_close wait_after_close={args.wait_after_close:.1f}s")
+                        arm.set_servo(GRIPPER_SERVO_INDEX, args.gripper_close)
+                        start_time = now
+                        command_sent = True
+                    if now - start_time >= args.gripper_wait:
+                        state = "WAIT_CLOSE"
+                        start_time = now
+                        command_sent = False
+                    arm.wait(tick)
+                    continue
+
+                if state == "WAIT_CLOSE":
+                    if now - start_time >= args.wait_after_close:
+                        state = "MOVE_TO_DROP"
+                        command_sent = False
+                        start_time = 0.0
+                    arm.wait(tick)
+                    continue
+
+                if state == "MOVE_TO_DROP":
+                    if not command_sent:
+                        print("[robot] step=move_to_drop")
+                        arm.move_to(*drop_point, speed=args.speed)
+                        start_time = now
+                        command_sent = True
+                    if now - start_time >= args.move_wait:
+                        state = "WAIT_DROP"
+                        start_time = now
+                        command_sent = False
+                    arm.wait(tick)
+                    continue
+
+                if state == "WAIT_DROP":
+                    if now - start_time >= args.wait_at_drop:
+                        state = "RELEASE_OPEN"
+                        command_sent = False
+                        start_time = 0.0
+                    arm.wait(tick)
+                    continue
+
+                if state == "RELEASE_OPEN":
+                    if not command_sent:
+                        print("[robot] step=release_open")
+                        arm.set_servo(GRIPPER_SERVO_INDEX, GRIPPER_OPEN_ANGLE)
+                        start_time = now
+                        command_sent = True
+                    if now - start_time >= args.gripper_wait:
+                        state = "WAIT_RELEASE"
+                        start_time = now
+                        command_sent = False
+                    arm.wait(tick)
+                    continue
+
+                if state == "WAIT_RELEASE":
+                    if now - start_time >= args.wait_after_open:
+                        state = "MOVE_HOME"
+                        command_sent = False
+                        start_time = 0.0
+                    arm.wait(tick)
+                    continue
+
+                if state == "MOVE_HOME":
+                    if not command_sent:
+                        print("[robot] step=return_home")
+                        arm.move_to(*home_point, speed=args.speed)
+                        start_time = now
+                        command_sent = True
+                    if now - start_time >= args.move_wait:
+                        state = "WAIT_HOME"
+                        start_time = now
+                        command_sent = False
+                    arm.wait(tick)
+                    continue
+
+                if state == "WAIT_HOME":
+                    if now - start_time >= args.wait_after_close:
+                        state = "IDLE"
+                        command_sent = False
+                        current_target = None
+                        busy_flag.clear()
+                        done_flag.set()
+                    arm.wait(tick)
+                    continue
     except Exception as exc:  # pragma: no cover - hardware path
         print(f"[robot] error: {exc}")
         busy_flag.clear()
@@ -237,7 +378,7 @@ def detection_loop(args: argparse.Namespace) -> None:
                         continue
 
                     try:
-                        target_queue.put_nowait((rx, ry, args.z_height, cls_id))
+                        target_queue.put_nowait((rx, ry, args.pick_z, cls_id))
                         busy_flag.set()
                         last_sent_time = now
                         last_sent_xy = (rx, ry)
@@ -263,21 +404,32 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Combine YOLOv8 detection with homography-based hand-eye calibration")
     parser.add_argument("--weights", type=str, default=r"D:\yolo\runs\detect\train\weights\best.pt", help="YOLO model weights")
     parser.add_argument("--camera-id", type=int, default=2, help="OpenCV camera index")
-    parser.add_argument("--conf", type=float, default=0.62, help="YOLO detection confidence threshold")
-    parser.add_argument("--min-pick-conf", type=float, default=0.65, help="Minimum confidence to send a pick command")
+    parser.add_argument("--conf", type=float, default=0.7, help="YOLO detection confidence threshold")
+    parser.add_argument("--min-pick-conf", type=float, default=0.7, help="Minimum confidence to send a pick command")
     parser.add_argument("--classes", nargs="*", help="Optional class name filter for picking")
     parser.add_argument("--parms-dir", type=str, default="save_parms", help="Directory containing homography.npy")
-    parser.add_argument("--z-height", type=float, default=70.0, help="Table Z height for picking (mm)")
+    parser.add_argument("--z-height", type=float, default=90.0, help="Table Z height for picking (mm)")
+    parser.add_argument("--pick-z", type=float, default=None, help="Optional pick Z override; defaults to --z-height")
     parser.add_argument("--speed", type=int, default=50, help="Robot move speed hint")
     parser.add_argument("--move-wait", type=float, default=3.0, help="Wait after each move_to before next action (s)")
-    parser.add_argument("--hold-time", type=float, default=5.0, help="Pause at target before returning (s)")
-    parser.add_argument("--settle", type=float, default=0.5, help="Pause after return move (s)")
+    parser.add_argument("--gripper-close", type=int, default=0, help="Gripper close angle for clamp (servo index 1)")
+    parser.add_argument("--gripper-wait", type=float, default=0.4, help="Wait after gripper open/close command (s)")
+    parser.add_argument("--wait-at-target", type=float, default=3.0, help="Wait at target after arriving (s)")
+    parser.add_argument("--wait-after-open", type=float, default=3.0, help="Wait after gripper open (s)")
+    parser.add_argument("--wait-after-close", type=float, default=3.0, help="Wait after gripper close (s)")
+    parser.add_argument("--drop-x", type=float, default=0.0, help="Drop point X (mm)")
+    parser.add_argument("--drop-y", type=float, default=150.0, help="Drop point Y (mm)")
+    parser.add_argument("--drop-z", type=float, default=90.0, help="Drop point Z (mm)")
+    parser.add_argument("--wait-at-drop", type=float, default=3.0, help="Wait at drop point before release (s)")
     parser.add_argument("--cooldown", type=float, default=1.5, help="Global cooldown after sending a target (s)")
     parser.add_argument("--same-target-mm", type=float, default=20.0, help="Treat target as same if XY distance is within this threshold (mm)")
     parser.add_argument("--same-target-sec", type=float, default=8.0, help="Dedup time window for same-target check (s)")
-    parser.add_argument("--calib-x", type=float, default=0.0, help="Calibration/home X to return after move (mm)")
-    parser.add_argument("--calib-y", type=float, default=200.0, help="Calibration/home Y to return after move (mm)")
-    parser.add_argument("--calib-z", type=float, default=90.0, help="Calibration/home Z to return after move (mm)")
+    parser.add_argument("--home-x", type=float, default=0.0, help="Home X to return after move (mm)")
+    parser.add_argument("--home-y", type=float, default=200.0, help="Home Y to return after move (mm)")
+    parser.add_argument("--home-z", type=float, default=90.0, help="Home Z to return after move (mm)")
+    parser.add_argument("--calib-x", type=float, default=None, help="(Deprecated) alias for --home-x")
+    parser.add_argument("--calib-y", type=float, default=None, help="(Deprecated) alias for --home-y")
+    parser.add_argument("--calib-z", type=float, default=None, help="(Deprecated) alias for --home-z")
     parser.add_argument("--host", type=str, default="10.149.65.232", help="Robot IP address")
     parser.add_argument("--port", type=int, default=5000, help="Robot TCP port")
     parser.add_argument("--dry-run", action="store_true", help="Print commands instead of sending to robot")
@@ -307,6 +459,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    # Backward-compatibility for pick Z and home aliases.
+    args.pick_z = args.pick_z if args.pick_z is not None else args.z_height
+    if args.calib_x is not None:
+        args.home_x = args.calib_x
+    if args.calib_y is not None:
+        args.home_y = args.calib_y
+    if args.calib_z is not None:
+        args.home_z = args.calib_z
     detection_loop(args)
 
 
