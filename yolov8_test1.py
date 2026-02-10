@@ -31,8 +31,9 @@ from ultralytics import YOLO
 from Hand_Eye_Calibration import HomographyResult
 from freenove_arm import FreenoveArmClient
 
-GRIPPER_SERVO_INDEX = 1
-GRIPPER_OPEN_ANGLE = 90
+GRIPPER_SERVO_INDEX = 4
+GRIPPER_OPEN_ANGLE = 55
+GRIPPER_CLOSE_ANGLE = 15
 
 
 # --------------------------------------------------------------------------- #
@@ -88,6 +89,47 @@ def robot_worker(
             auto_enable=not args.skip_enable,
             verbose=args.verbose,
         ) as arm:
+            queue_sync_enabled = False
+            if args.queue_sync and not args.dry_run:
+                try:
+                    arm.set_action_feedback(True)
+                    queue_sync_enabled = True
+                    print("[robot] queue feedback sync enabled (S12 K1)")
+                except Exception as exc:
+                    print(f"[robot] queue feedback unavailable, fallback to time wait: {exc}")
+                    queue_sync_enabled = False
+
+            def move_phase_done(start_t: float) -> bool:
+                nonlocal queue_sync_enabled
+                # Keep historical minimum wait and optionally ensure TCP queue backlog is drained.
+                if (time.time() - start_t) < args.move_wait:
+                    return False
+                if not queue_sync_enabled:
+                    return True
+                try:
+                    ok = arm.wait_action_queue_empty(
+                        timeout=args.sync_timeout,
+                        min_empty_time=args.queue_empty_stable,
+                        poll_interval=tick,
+                    )
+                    if not ok:
+                        print("[robot] queue sync timeout, fallback to time wait")
+                        queue_sync_enabled = False
+                        try:
+                            arm.set_action_feedback(False)
+                        except Exception:
+                            pass
+                        return True
+                    return True
+                except Exception as exc:
+                    print(f"[robot] queue sync error, fallback to time wait: {exc}")
+                    queue_sync_enabled = False
+                    try:
+                        arm.set_action_feedback(False)
+                    except Exception:
+                        pass
+                    return True
+
             if args.home_first:
                 arm.return_to_sensor_point(1)
                 arm.wait(0.5)
@@ -97,6 +139,7 @@ def robot_worker(
             print("[robot] connected to arm")
             home_point = (args.home_x, args.home_y, args.home_z)
             drop_point = (args.drop_x, args.drop_y, args.drop_z)
+            drop_release_point = (args.drop_x, args.drop_y, args.drop_release_z)
             state = "IDLE"
             command_sent = False
             start_time = 0.0
@@ -130,7 +173,7 @@ def robot_worker(
                         arm.move_to(x, y, z, speed=args.speed)
                         start_time = now
                         command_sent = True
-                    if now - start_time >= args.move_wait:
+                    if move_phase_done(start_time):
                         state = "WAIT_TARGET"
                         command_sent = False
                         start_time = now
@@ -169,7 +212,7 @@ def robot_worker(
                 if state == "GRIPPER_CLOSE":
                     if not command_sent:
                         print(f"[robot] step=gripper_close wait_after_close={args.wait_after_close:.1f}s")
-                        arm.set_servo(GRIPPER_SERVO_INDEX, args.gripper_close)
+                        arm.set_servo(GRIPPER_SERVO_INDEX, GRIPPER_CLOSE_ANGLE)
                         start_time = now
                         command_sent = True
                     if now - start_time >= args.gripper_wait:
@@ -181,26 +224,52 @@ def robot_worker(
 
                 if state == "WAIT_CLOSE":
                     if now - start_time >= args.wait_after_close:
-                        state = "MOVE_TO_DROP"
+                        state = "LIFT_AFTER_GRIP"
                         command_sent = False
                         start_time = 0.0
                     arm.wait(tick)
                     continue
 
-                if state == "MOVE_TO_DROP":
+                if state == "LIFT_AFTER_GRIP":
                     if not command_sent:
-                        print("[robot] step=move_to_drop")
-                        arm.move_to(*drop_point, speed=args.speed)
+                        print(f"[robot] step=lift_after_grip target_z={args.drop_z:.1f}")
+                        arm.move_to(x, y, args.drop_z, speed=args.speed)
                         start_time = now
                         command_sent = True
-                    if now - start_time >= args.move_wait:
-                        state = "WAIT_DROP"
+                    if move_phase_done(start_time):
+                        state = "MOVE_TO_DROP"
                         start_time = now
                         command_sent = False
                     arm.wait(tick)
                     continue
 
-                if state == "WAIT_DROP":
+                if state == "MOVE_TO_DROP":
+                    if not command_sent:
+                        print(f"[robot] step=move_to_drop_top drop_z={args.drop_z:.1f}")
+                        arm.move_to(*drop_point, speed=args.speed)
+                        start_time = now
+                        command_sent = True
+                    if move_phase_done(start_time):
+                        state = "MOVE_TO_DROP_RELEASE_Z"
+                        start_time = now
+                        command_sent = False
+                    arm.wait(tick)
+                    continue
+
+                if state == "MOVE_TO_DROP_RELEASE_Z":
+                    if not command_sent:
+                        print(f"[robot] step=drop_descend release_z={args.drop_release_z:.1f}")
+                        arm.move_to(*drop_release_point, speed=args.speed)
+                        start_time = now
+                        command_sent = True
+                    if move_phase_done(start_time):
+                        state = "WAIT_DROP_RELEASE"
+                        start_time = now
+                        command_sent = False
+                    arm.wait(tick)
+                    continue
+
+                if state == "WAIT_DROP_RELEASE":
                     if now - start_time >= args.wait_at_drop:
                         state = "RELEASE_OPEN"
                         command_sent = False
@@ -223,6 +292,19 @@ def robot_worker(
 
                 if state == "WAIT_RELEASE":
                     if now - start_time >= args.wait_after_open:
+                        state = "RELEASE_CLOSE"
+                        command_sent = False
+                        start_time = 0.0
+                    arm.wait(tick)
+                    continue
+
+                if state == "RELEASE_CLOSE":
+                    if not command_sent:
+                        print("[robot] step=release_close")
+                        arm.set_servo(GRIPPER_SERVO_INDEX, GRIPPER_CLOSE_ANGLE)
+                        start_time = now
+                        command_sent = True
+                    if now - start_time >= args.gripper_wait:
                         state = "MOVE_HOME"
                         command_sent = False
                         start_time = 0.0
@@ -235,7 +317,7 @@ def robot_worker(
                         arm.move_to(*home_point, speed=args.speed)
                         start_time = now
                         command_sent = True
-                    if now - start_time >= args.move_wait:
+                    if move_phase_done(start_time):
                         state = "WAIT_HOME"
                         start_time = now
                         command_sent = False
@@ -251,6 +333,11 @@ def robot_worker(
                         done_flag.set()
                     arm.wait(tick)
                     continue
+            if queue_sync_enabled:
+                try:
+                    arm.set_action_feedback(False)
+                except Exception as exc:
+                    print(f"[robot] failed to disable queue feedback cleanly: {exc}")
     except Exception as exc:  # pragma: no cover - hardware path
         print(f"[robot] error: {exc}")
         busy_flag.clear()
@@ -412,15 +499,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pick-z", type=float, default=None, help="Optional pick Z override; defaults to --z-height")
     parser.add_argument("--speed", type=int, default=50, help="Robot move speed hint")
     parser.add_argument("--move-wait", type=float, default=3.0, help="Wait after each move_to before next action (s)")
-    parser.add_argument("--gripper-close", type=int, default=0, help="Gripper close angle for clamp (servo index 1)")
+    parser.add_argument(
+        "--queue-sync",
+        dest="queue_sync",
+        action="store_true",
+        default=True,
+        help="Enable S12 queue feedback synchronization for move transitions",
+    )
+    parser.add_argument(
+        "--no-queue-sync",
+        dest="queue_sync",
+        action="store_false",
+        help="Disable queue feedback sync and use pure time waits",
+    )
+    parser.add_argument(
+        "--sync-timeout",
+        type=float,
+        default=2.0,
+        help="Timeout for waiting queue feedback to report empty (s)",
+    )
+    parser.add_argument(
+        "--queue-empty-stable",
+        type=float,
+        default=0.05,
+        help="Required stable duration with queue length 0 before considering it empty (s)",
+    )
+    parser.add_argument("--gripper-servo-index", type=int, default=GRIPPER_SERVO_INDEX, help="Gripper servo index")
+    parser.add_argument("--gripper-open", type=int, default=GRIPPER_OPEN_ANGLE, help="Gripper open angle")
+    parser.add_argument("--gripper-close", type=int, default=GRIPPER_CLOSE_ANGLE, help="Gripper close angle")
     parser.add_argument("--gripper-wait", type=float, default=0.4, help="Wait after gripper open/close command (s)")
     parser.add_argument("--wait-at-target", type=float, default=3.0, help="Wait at target after arriving (s)")
     parser.add_argument("--wait-after-open", type=float, default=3.0, help="Wait after gripper open (s)")
     parser.add_argument("--wait-after-close", type=float, default=3.0, help="Wait after gripper close (s)")
     parser.add_argument("--drop-x", type=float, default=0.0, help="Drop point X (mm)")
     parser.add_argument("--drop-y", type=float, default=150.0, help="Drop point Y (mm)")
-    parser.add_argument("--drop-z", type=float, default=90.0, help="Drop point Z (mm)")
-    parser.add_argument("--wait-at-drop", type=float, default=3.0, help="Wait at drop point before release (s)")
+    parser.add_argument("--drop-z", type=float, default=120.0, help="Drop transfer height Z (mm)")
+    parser.add_argument("--drop-release-z", type=float, default=90.0, help="Drop release height Z (mm)")
+    parser.add_argument("--wait-at-drop", type=float, default=3.0, help="Wait at drop release height before release (s)")
     parser.add_argument("--cooldown", type=float, default=1.5, help="Global cooldown after sending a target (s)")
     parser.add_argument("--same-target-mm", type=float, default=20.0, help="Treat target as same if XY distance is within this threshold (mm)")
     parser.add_argument("--same-target-sec", type=float, default=8.0, help="Dedup time window for same-target check (s)")
@@ -458,7 +573,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    global GRIPPER_SERVO_INDEX, GRIPPER_OPEN_ANGLE, GRIPPER_CLOSE_ANGLE
     args = parse_args()
+    GRIPPER_SERVO_INDEX = int(args.gripper_servo_index)
+    GRIPPER_OPEN_ANGLE = int(args.gripper_open)
+    GRIPPER_CLOSE_ANGLE = int(args.gripper_close)
     # Backward-compatibility for pick Z and home aliases.
     args.pick_z = args.pick_z if args.pick_z is not None else args.z_height
     if args.calib_x is not None:

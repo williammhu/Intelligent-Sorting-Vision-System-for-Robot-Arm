@@ -18,33 +18,65 @@ class Client:
             self.client_socket.settimeout(None)                                      
             self.connect_flag = True                                                 
         except:
-            self.client_socket.close()                                              
+            try:
+                self.client_socket.close()
+            except:
+                pass
             self.connect_flag = False                                               
         return self.connect_flag                                                 
 
     def disconnect(self):
-        self.connect_flag = False        
-        self.client_socket.shutdown(2)     
-        self.client_socket.close()       
+        self.connect_flag = False
+        try:
+            self.client_socket.shutdown(socket.SHUT_RDWR)
+        except:
+            pass
+        try:
+            self.client_socket.close()
+        except:
+            pass
 
     def send_messages(self, data):
         try:
             if self.connect_flag:
-                self.client_socket.send(data.encode('utf-8'))
+                self.client_socket.sendall(data.encode('utf-8'))
         except:
             print("Client send data failed.")
 
-    def receive_messages(self):
-        while True:
+    def receive_messages(self, stop_event=None, on_data=None, timeout_s=0.2):
+        previous_timeout = None
+        try:
+            previous_timeout = self.client_socket.gettimeout()
+        except:
+            previous_timeout = None
+        try:
+            self.client_socket.settimeout(timeout_s)
+        except:
+            pass
+
+        while self.connect_flag:
+            if stop_event is not None and stop_event.is_set():
+                break
             try:
                 data = self.client_socket.recv(1024).decode('utf-8')
                 if data != '':
-                    self.data_queue.put(data)
+                    if on_data is None:
+                        self.data_queue.put(data)
+                    else:
+                        on_data(data)
                 else:
                     self.connect_flag = False
+                    break
+            except socket.timeout:
+                continue
             except:
                 self.connect_flag = False
                 break
+
+        try:
+            self.client_socket.settimeout(previous_timeout)
+        except:
+            pass
 
 
 if __name__ == '__main__':
@@ -59,7 +91,6 @@ if __name__ == '__main__':
     wifi.disconnect()
     print("Close tcp.")
     pass
-
 
 
 
