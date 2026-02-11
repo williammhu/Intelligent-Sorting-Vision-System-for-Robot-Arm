@@ -31,9 +31,9 @@ from ultralytics import YOLO
 from Hand_Eye_Calibration import HomographyResult
 from freenove_arm import FreenoveArmClient
 
-GRIPPER_SERVO_INDEX = 4
-GRIPPER_OPEN_ANGLE = 55
-GRIPPER_CLOSE_ANGLE = 15
+GRIPPER_SERVO_INDEX = 0
+GRIPPER_OPEN_ANGLE = 70
+GRIPPER_CLOSE_ANGLE = 0
 
 
 # --------------------------------------------------------------------------- #
@@ -527,7 +527,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gripper-servo-index", type=int, default=GRIPPER_SERVO_INDEX, help="Gripper servo index")
     parser.add_argument("--gripper-open", type=int, default=GRIPPER_OPEN_ANGLE, help="Gripper open angle")
     parser.add_argument("--gripper-close", type=int, default=GRIPPER_CLOSE_ANGLE, help="Gripper close angle")
-    parser.add_argument("--gripper-wait", type=float, default=0.4, help="Wait after gripper open/close command (s)")
+    parser.add_argument("--gripper-wait", type=float, default=3.0, help="Wait after gripper open/close command (s)")
     parser.add_argument("--wait-at-target", type=float, default=3.0, help="Wait at target after arriving (s)")
     parser.add_argument("--wait-after-open", type=float, default=3.0, help="Wait after gripper open (s)")
     parser.add_argument("--wait-after-close", type=float, default=3.0, help="Wait after gripper close (s)")

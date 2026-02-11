@@ -21,8 +21,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--host", type=str, default="10.149.65.232", help="Robot IP address")
     p.add_argument("--port", type=int, default=5000, help="Robot TCP port")
     p.add_argument("--servo-index", type=int, default=0, help="Servo index (GPIO16 is typically index 1)")
-    p.add_argument("--gripper-open", type=int, default=55.0, help="Open angle")
-    p.add_argument("--gripper-close", type=int, default=0.0, help="Close angle (reset)")
+    p.add_argument("--gripper-open", type=int, default=55, help="Open angle")
+    p.add_argument("--gripper-close", type=int, default=0, help="Close angle (reset)")
     p.add_argument("--gripper-wait", type=float, default=0.4, help="Wait after each servo command (s)")
     p.add_argument("--ramp", action="store_true", help="Move servo gradually (slower open/close)")
     p.add_argument("--step-size", type=int, default=5, help="Angle increment per ramp step (deg)")
@@ -133,7 +133,7 @@ def main() -> None:
         move_servo(arm, args.servo_index, args.gripper_close, args.gripper_wait, "startup_close_again", state)
 
         if args.mode == "open":
-            send_angle(arm, args.servo_index, args.gripper_open, args.gripper_wait, "open")
+            move_servo(arm, args.servo_index, args.gripper_open, args.gripper_wait, "open", state)
             return
 
         if args.mode == "close":
