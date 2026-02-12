@@ -31,6 +31,7 @@ from ultralytics import YOLO
 from Hand_Eye_Calibration import HomographyResult
 from freenove_arm import FreenoveArmClient
 
+
 GRIPPER_SERVO_INDEX = 0
 GRIPPER_OPEN_ANGLE = 70
 GRIPPER_CLOSE_ANGLE = 0
@@ -369,6 +370,11 @@ def detection_loop(args: argparse.Namespace) -> None:
     done_flag = threading.Event()
     last_sent_time: Optional[float] = None
     last_sent_xy: Optional[Tuple[float, float]] = None
+    confirm_start_time: Optional[float] = None
+    confirm_cls_id: Optional[int] = None
+    confirm_xy: Optional[Tuple[float, float]] = None
+    confirm_duration_sec = 2.0
+    confirm_conf_threshold = max(0.7, float(args.min_pick_conf))
 
     robot_thread = threading.Thread(
         target=robot_worker,
@@ -405,6 +411,7 @@ def detection_loop(args: argparse.Namespace) -> None:
 
             best_idx = select_best_box(result, allowed)
             status = "No target"
+            status_color = (0, 255, 0)
 
             if best_idx is not None:
                 xyxy = result.boxes.xyxy[best_idx].cpu().numpy()
@@ -413,67 +420,76 @@ def detection_loop(args: argparse.Namespace) -> None:
                 cx = float((xyxy[0] + xyxy[2]) / 2.0)
                 cy = float((xyxy[1] + xyxy[3]) / 2.0)
                 rx, ry = pixel_to_robot((cx, cy), homography)
-
-                # draw overlay
-                cv2.rectangle(frame, (int(xyxy[0]), int(xyxy[1])), (int(xyxy[2]), int(xyxy[3])), (0, 255, 0), 2)
-                cv2.circle(frame, (int(cx), int(cy)), 4, (0, 0, 255), -1)
-                cv2.putText(
-                    frame,
-                    f"{result.names[cls_id]} {conf:.2f}",
-                    (int(xyxy[0]), int(xyxy[1]) - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (255, 255, 255),
-                    2,
-                )
-                cv2.putText(
-                    frame,
-                    f"robot XY=({rx:.1f},{ry:.1f})",
-                    (int(xyxy[0]), int(xyxy[1]) + 18),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (0, 255, 0),
-                    2,
-                )
-
-                if conf >= args.min_pick_conf and not busy_flag.is_set():
+                if conf >= confirm_conf_threshold:
                     now = time.time()
-                    in_cooldown = last_sent_time is not None and (now - last_sent_time) < args.cooldown
-                    same_recent = False
-                    if last_sent_time is not None and last_sent_xy is not None:
-                        dt = now - last_sent_time
-                        dx = rx - last_sent_xy[0]
-                        dy = ry - last_sent_xy[1]
+                    if confirm_start_time is not None and confirm_xy is not None and confirm_cls_id is not None:
+                        dx = rx - confirm_xy[0]
+                        dy = ry - confirm_xy[1]
                         dist = (dx * dx + dy * dy) ** 0.5
-                        same_recent = dt <= args.same_target_sec and dist <= args.same_target_mm
+                        same_candidate = cls_id == confirm_cls_id and dist <= args.same_target_mm
+                    else:
+                        same_candidate = True
 
-                    if in_cooldown:
-                        remaining = args.cooldown - (now - last_sent_time)
-                        status = f"Cooldown {max(0.0, remaining):.1f}s"
-                        cv2.putText(frame, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-                        cv2.imshow("yolo + hand-eye", frame)
-                        if (cv2.waitKey(1) & 0xFF) == ord("q"):
-                            break
-                        continue
+                    if confirm_start_time is None or not same_candidate:
+                        confirm_start_time = now
 
-                    if same_recent:
-                        status = "Dedup skip"
-                        cv2.putText(frame, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-                        cv2.imshow("yolo + hand-eye", frame)
-                        if (cv2.waitKey(1) & 0xFF) == ord("q"):
-                            break
-                        continue
+                    confirm_cls_id = cls_id
+                    confirm_xy = (rx, ry)
+                    elapsed = now - confirm_start_time
+                    remaining = max(0.0, confirm_duration_sec - elapsed)
 
-                    try:
-                        target_queue.put_nowait((rx, ry, args.pick_z, cls_id))
-                        busy_flag.set()
-                        last_sent_time = now
-                        last_sent_xy = (rx, ry)
-                        status = "Target sent"
-                    except queue.Full:
-                        status = "Queue full"
+                    x1, y1, x2, y2 = [int(v) for v in xyxy]
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
+                    cls_name = result.names[cls_id]
+                    box_label = f"{cls_name} {conf:.2f}"
+                    cv2.putText(frame, box_label, (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-            cv2.putText(frame, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                    if elapsed < confirm_duration_sec:
+                        status = f"Confirming {remaining:.1f}s left"
+                        status_color = (0, 255, 255)
+                    else:
+                        in_cooldown = last_sent_time is not None and (now - last_sent_time) < args.cooldown
+                        same_recent = False
+                        if last_sent_time is not None and last_sent_xy is not None:
+                            dt = now - last_sent_time
+                            dx = rx - last_sent_xy[0]
+                            dy = ry - last_sent_xy[1]
+                            dist = (dx * dx + dy * dy) ** 0.5
+                            same_recent = dt <= args.same_target_sec and dist <= args.same_target_mm
+
+                        if in_cooldown:
+                            remaining_cd = args.cooldown - (now - last_sent_time)
+                            status = f"Cooldown {max(0.0, remaining_cd):.1f}s"
+                            status_color = (0, 255, 255)
+                        elif same_recent:
+                            status = "Dedup skip"
+                            status_color = (0, 255, 255)
+                        else:
+                            try:
+                                target_queue.put_nowait((rx, ry, args.pick_z, cls_id))
+                                busy_flag.set()
+                                last_sent_time = now
+                                last_sent_xy = (rx, ry)
+                                status = "Target sent"
+                            except queue.Full:
+                                status = "Queue full"
+                                status_color = (0, 255, 255)
+
+                        confirm_start_time = None
+                        confirm_cls_id = None
+                        confirm_xy = None
+                else:
+                    confirm_start_time = None
+                    confirm_cls_id = None
+                    confirm_xy = None
+                    status = f"Low conf {conf:.2f}"
+                    status_color = (0, 255, 255)
+            else:
+                confirm_start_time = None
+                confirm_cls_id = None
+                confirm_xy = None
+
+            cv2.putText(frame, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
             cv2.imshow("yolo + hand-eye", frame)
             if (cv2.waitKey(1) & 0xFF) == ord("q"):
                 break
