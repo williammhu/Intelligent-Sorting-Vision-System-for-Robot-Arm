@@ -1,6 +1,6 @@
 """
 YOLOv8 + hand-eye calibration (planar homography) pick-and-place demo.
-
+两秒稳定检测后画框，zxing解码，随后机械臂移动
 Workflow
 --------
 1) Run Hand_Eye_Calibration.py --mode calibrate (or calibration_test.py) to generate
