@@ -19,14 +19,17 @@ robot motion runs in a background thread. 本版本采用循环取放：检测�
 from __future__ import annotations
 
 import argparse
+import os
 import queue
 import threading
+import tempfile
 import time
 from typing import Optional, Sequence, Set, Tuple
 
 import cv2
 import numpy as np
 from ultralytics import YOLO
+import zxing
 
 from Hand_Eye_Calibration import HomographyResult
 from freenove_arm import FreenoveArmClient
@@ -35,6 +38,7 @@ from freenove_arm import FreenoveArmClient
 GRIPPER_SERVO_INDEX = 0
 GRIPPER_OPEN_ANGLE = 70
 GRIPPER_CLOSE_ANGLE = 0
+ZXING_READER = zxing.BarCodeReader()
 
 
 # --------------------------------------------------------------------------- #
@@ -66,6 +70,29 @@ def select_best_box(result, allowed: Optional[Set[str]]) -> Optional[int]:
             best_conf = conf
             best_idx = i
     return best_idx
+
+
+def decode_with_zxing(image: np.ndarray) -> Optional[str]:
+    """
+    Decode barcode/QR with ZXing.
+    The python binding expects a file path, so write a temporary PNG first.
+    """
+    ok, buf = cv2.imencode(".png", image)
+    if not ok:
+        return None
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+            tmp.write(buf.tobytes())
+            tmp_path = tmp.name
+        result = ZXING_READER.decode(tmp_path, try_harder=True)
+        if result is None:
+            return None
+        return getattr(result, "parsed", None) or getattr(result, "raw", None)
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 # --------------------------------------------------------------------------- #
@@ -363,6 +390,17 @@ def detection_loop(args: argparse.Namespace) -> None:
 
     if not cap.isOpened():
         raise SystemExit("Could not open camera")
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.cam_width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.cam_height)
+    cap.set(cv2.CAP_PROP_FPS, args.cam_fps)
+    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    actual_fps = cap.get(cv2.CAP_PROP_FPS)
+    print(
+        f"[CAM] requested {args.cam_width}x{args.cam_height}@{args.cam_fps} -> "
+        f"got {actual_w}x{actual_h}@{actual_fps:.1f}",
+        flush=True,
+    )
 
     allowed = set(args.classes) if args.classes else None
     target_queue: queue.Queue = queue.Queue(maxsize=1)
@@ -370,10 +408,14 @@ def detection_loop(args: argparse.Namespace) -> None:
     done_flag = threading.Event()
     last_sent_time: Optional[float] = None
     last_sent_xy: Optional[Tuple[float, float]] = None
+    last_sent_code: Optional[str] = None
+    last_printed_code: Optional[str] = None
+    last_printed_time: float = 0.0
     confirm_start_time: Optional[float] = None
     confirm_cls_id: Optional[int] = None
     confirm_xy: Optional[Tuple[float, float]] = None
-    confirm_duration_sec = 2.0
+    confirm_code: Optional[str] = None
+    confirm_duration_sec = 0.1
     confirm_conf_threshold = max(0.7, float(args.min_pick_conf))
 
     robot_thread = threading.Thread(
@@ -406,91 +448,155 @@ def detection_loop(args: argparse.Namespace) -> None:
             result = model.predict(
                 source=frame,
                 conf=args.conf,
+                imgsz=args.imgsz,
                 verbose=False,
             )[0]
+            vis = result.plot()
 
-            best_idx = select_best_box(result, allowed)
             status = "No target"
             status_color = (0, 255, 0)
+            boxes = result.boxes
+            if boxes is not None and len(boxes) > 0:
+                h, w = frame.shape[:2]
+                decoded_candidates = []
 
-            if best_idx is not None:
-                xyxy = result.boxes.xyxy[best_idx].cpu().numpy()
-                cls_id = int(result.boxes.cls[best_idx])
-                conf = float(result.boxes.conf[best_idx])
-                cx = float((xyxy[0] + xyxy[2]) / 2.0)
-                cy = float((xyxy[1] + xyxy[3]) / 2.0)
-                rx, ry = pixel_to_robot((cx, cy), homography)
-                if conf >= confirm_conf_threshold:
-                    now = time.time()
-                    if confirm_start_time is not None and confirm_xy is not None and confirm_cls_id is not None:
-                        dx = rx - confirm_xy[0]
-                        dy = ry - confirm_xy[1]
-                        dist = (dx * dx + dy * dy) ** 0.5
-                        same_candidate = cls_id == confirm_cls_id and dist <= args.same_target_mm
-                    else:
-                        same_candidate = True
-
-                    if confirm_start_time is None or not same_candidate:
-                        confirm_start_time = now
-
-                    confirm_cls_id = cls_id
-                    confirm_xy = (rx, ry)
-                    elapsed = now - confirm_start_time
-                    remaining = max(0.0, confirm_duration_sec - elapsed)
-
-                    x1, y1, x2, y2 = [int(v) for v in xyxy]
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
+                for i in range(len(boxes)):
+                    cls_id = int(boxes.cls[i])
+                    conf = float(boxes.conf[i])
                     cls_name = result.names[cls_id]
+                    if allowed and cls_name not in allowed:
+                        continue
+
+                    xyxy = boxes.xyxy[i].cpu().numpy()
+                    x1, y1, x2, y2 = [int(v) for v in xyxy]
+                    cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 255), 2)
+
+                    decoded_text: Optional[str] = None
+                    x1c = max(0, min(x1, w - 1))
+                    x2c = max(0, min(x2, w - 1))
+                    y1c = max(0, min(y1, h - 1))
+                    y2c = max(0, min(y2, h - 1))
+                    if x2c > x1c and y2c > y1c:
+                        roi = frame[y1c:y2c, x1c:x2c]
+                        roi_big = cv2.resize(roi, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_LINEAR)
+                        gray = cv2.cvtColor(roi_big, cv2.COLOR_BGR2GRAY)
+                        _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                        decoded_text = decode_with_zxing(bw)
+
+                        if decoded_text:
+                            now_print = time.time()
+                            if decoded_text != last_printed_code or (now_print - last_printed_time) >= 1.0:
+                                print(f"[ZXING] {decoded_text}", flush=True)
+                                last_printed_code = decoded_text
+                                last_printed_time = now_print
+
                     box_label = f"{cls_name} {conf:.2f}"
-                    cv2.putText(frame, box_label, (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    if decoded_text:
+                        box_label = f"{box_label} | {decoded_text[:50]}"
+                    cv2.putText(
+                        vis, box_label, (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2
+                    )
 
-                    if elapsed < confirm_duration_sec:
-                        status = f"Confirming {remaining:.1f}s left"
-                        status_color = (0, 255, 255)
-                    else:
-                        in_cooldown = last_sent_time is not None and (now - last_sent_time) < args.cooldown
-                        same_recent = False
-                        if last_sent_time is not None and last_sent_xy is not None:
-                            dt = now - last_sent_time
-                            dx = rx - last_sent_xy[0]
-                            dy = ry - last_sent_xy[1]
+                    if decoded_text:
+                        cx = float((xyxy[0] + xyxy[2]) / 2.0)
+                        cy = float((xyxy[1] + xyxy[3]) / 2.0)
+                        rx, ry = pixel_to_robot((cx, cy), homography)
+                        decoded_candidates.append((conf, cls_id, rx, ry, decoded_text))
+
+                if decoded_candidates:
+                    decoded_candidates.sort(key=lambda item: item[0], reverse=True)
+                    conf, cls_id, rx, ry, decoded_text = decoded_candidates[0]
+
+                    if conf >= confirm_conf_threshold:
+                        now = time.time()
+                        if (
+                            confirm_start_time is not None
+                            and confirm_xy is not None
+                            and confirm_cls_id is not None
+                            and confirm_code is not None
+                        ):
+                            dx = rx - confirm_xy[0]
+                            dy = ry - confirm_xy[1]
                             dist = (dx * dx + dy * dy) ** 0.5
-                            same_recent = dt <= args.same_target_sec and dist <= args.same_target_mm
+                            same_candidate = (
+                                cls_id == confirm_cls_id
+                                and decoded_text == confirm_code
+                                and dist <= args.same_target_mm
+                            )
+                        else:
+                            same_candidate = True
 
-                        if in_cooldown:
-                            remaining_cd = args.cooldown - (now - last_sent_time)
-                            status = f"Cooldown {max(0.0, remaining_cd):.1f}s"
-                            status_color = (0, 255, 255)
-                        elif same_recent:
-                            status = "Dedup skip"
+                        if confirm_start_time is None or not same_candidate:
+                            confirm_start_time = now
+
+                        confirm_cls_id = cls_id
+                        confirm_xy = (rx, ry)
+                        confirm_code = decoded_text
+                        elapsed = now - confirm_start_time
+                        remaining = max(0.0, confirm_duration_sec - elapsed)
+
+                        if elapsed < confirm_duration_sec:
+                            status = f"Barcode confirming {remaining:.1f}s left"
                             status_color = (0, 255, 255)
                         else:
-                            try:
-                                target_queue.put_nowait((rx, ry, args.pick_z, cls_id))
-                                busy_flag.set()
-                                last_sent_time = now
-                                last_sent_xy = (rx, ry)
-                                status = "Target sent"
-                            except queue.Full:
-                                status = "Queue full"
-                                status_color = (0, 255, 255)
+                            in_cooldown = last_sent_time is not None and (now - last_sent_time) < args.cooldown
+                            same_recent = False
+                            if last_sent_time is not None and last_sent_xy is not None:
+                                dt = now - last_sent_time
+                                dx = rx - last_sent_xy[0]
+                                dy = ry - last_sent_xy[1]
+                                dist = (dx * dx + dy * dy) ** 0.5
+                                same_recent = (
+                                    dt <= args.same_target_sec
+                                    and dist <= args.same_target_mm
+                                    and last_sent_code == decoded_text
+                                )
 
+                            if in_cooldown:
+                                remaining_cd = args.cooldown - (now - last_sent_time)
+                                status = f"Cooldown {max(0.0, remaining_cd):.1f}s"
+                                status_color = (0, 255, 255)
+                            elif same_recent:
+                                status = "Dedup skip"
+                                status_color = (0, 255, 255)
+                            else:
+                                try:
+                                    target_queue.put_nowait((rx, ry, args.pick_z, cls_id))
+                                    busy_flag.set()
+                                    last_sent_time = now
+                                    last_sent_xy = (rx, ry)
+                                    last_sent_code = decoded_text
+                                    status = "Target sent"
+                                except queue.Full:
+                                    status = "Queue full"
+                                    status_color = (0, 255, 255)
+
+                            confirm_start_time = None
+                            confirm_cls_id = None
+                            confirm_xy = None
+                            confirm_code = None
+                    else:
                         confirm_start_time = None
                         confirm_cls_id = None
                         confirm_xy = None
+                        confirm_code = None
+                        status = f"Low conf {conf:.2f}"
+                        status_color = (0, 255, 255)
                 else:
                     confirm_start_time = None
                     confirm_cls_id = None
                     confirm_xy = None
-                    status = f"Low conf {conf:.2f}"
+                    confirm_code = None
+                    status = "Barcode decode failed"
                     status_color = (0, 255, 255)
             else:
                 confirm_start_time = None
                 confirm_cls_id = None
                 confirm_xy = None
+                confirm_code = None
 
-            cv2.putText(frame, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
-            cv2.imshow("yolo + hand-eye", frame)
+            cv2.putText(vis, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
+            cv2.imshow("yolo + hand-eye", vis)
             if (cv2.waitKey(1) & 0xFF) == ord("q"):
                 break
     finally:
@@ -507,7 +613,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Combine YOLOv8 detection with homography-based hand-eye calibration")
     parser.add_argument("--weights", type=str, default=r"D:\yolo\runs\detect\train\weights\best.pt", help="YOLO model weights")
     parser.add_argument("--camera-id", type=int, default=2, help="OpenCV camera index")
+    parser.add_argument("--cam-width", type=int, default=1280, help="Requested camera width (pixels)")
+    parser.add_argument("--cam-height", type=int, default=720, help="Requested camera height (pixels)")
+    parser.add_argument("--cam-fps", type=int, default=30, help="Requested camera FPS")
     parser.add_argument("--conf", type=float, default=0.7, help="YOLO detection confidence threshold")
+    parser.add_argument("--imgsz", type=int, default=640, help="YOLO inference image size")
     parser.add_argument("--min-pick-conf", type=float, default=0.7, help="Minimum confidence to send a pick command")
     parser.add_argument("--classes", nargs="*", help="Optional class name filter for picking")
     parser.add_argument("--parms-dir", type=str, default="save_parms", help="Directory containing homography.npy")
