@@ -37,7 +37,7 @@ from freenove_arm import FreenoveArmClient
 
 GRIPPER_SERVO_INDEX = 0
 GRIPPER_OPEN_ANGLE = 70
-GRIPPER_CLOSE_ANGLE = 0
+GRIPPER_CLOSE_ANGLE = 10
 ZXING_READER = zxing.BarCodeReader()
 
 
@@ -168,6 +168,7 @@ def robot_worker(
             home_point = (args.home_x, args.home_y, args.home_z)
             drop_point = (args.drop_x, args.drop_y, args.drop_z)
             drop_release_point = (args.drop_x, args.drop_y, args.drop_release_z)
+            drop_post_open_lift_point = (args.drop_x, args.drop_y, args.post_open_lift_z)
             state = "IDLE"
             command_sent = False
             start_time = 0.0
@@ -188,12 +189,20 @@ def robot_worker(
                     current_target = item
                     busy_flag.set()
                     done_flag.clear()
-                    state = "MOVE_TO_TARGET"
+                    state = "PRE_OPEN_BEFORE_TARGET"
                     command_sent = False
                     start_time = 0.0
                     continue
 
                 x, y, z, cls_id = current_target  # type: ignore[misc]
+
+                if state == "PRE_OPEN_BEFORE_TARGET":
+                    print("[robot] step=pre_open_before_target (no wait)")
+                    arm.set_servo(GRIPPER_SERVO_INDEX, GRIPPER_OPEN_ANGLE)
+                    state = "MOVE_TO_TARGET"
+                    command_sent = False
+                    start_time = 0.0
+                    continue
 
                 if state == "MOVE_TO_TARGET":
                     if not command_sent:
@@ -312,14 +321,27 @@ def robot_worker(
                         start_time = now
                         command_sent = True
                     if now - start_time >= args.gripper_wait:
-                        state = "WAIT_RELEASE"
+                        state = "POST_RELEASE_LIFT"
                         start_time = now
                         command_sent = False
                     arm.wait(tick)
                     continue
 
-                if state == "WAIT_RELEASE":
-                    if now - start_time >= args.wait_after_open:
+                if state == "POST_RELEASE_LIFT":
+                    if not command_sent:
+                        print(f"[robot] step=post_release_lift target_z={args.post_open_lift_z:.1f}")
+                        arm.move_to(*drop_post_open_lift_point, speed=args.speed)
+                        start_time = now
+                        command_sent = True
+                    if move_phase_done(start_time):
+                        state = "WAIT_POST_RELEASE_LIFT"
+                        start_time = now
+                        command_sent = False
+                    arm.wait(tick)
+                    continue
+
+                if state == "WAIT_POST_RELEASE_LIFT":
+                    if now - start_time >= args.post_open_wait:
                         state = "RELEASE_CLOSE"
                         command_sent = False
                         start_time = 0.0
@@ -657,10 +679,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wait-at-target", type=float, default=3.0, help="Wait at target after arriving (s)")
     parser.add_argument("--wait-after-open", type=float, default=3.0, help="Wait after gripper open (s)")
     parser.add_argument("--wait-after-close", type=float, default=3.0, help="Wait after gripper close (s)")
-    parser.add_argument("--drop-x", type=float, default=0.0, help="Drop point X (mm)")
+    parser.add_argument("--drop-x", type=float, default=100.0, help="Drop point X (mm)")
     parser.add_argument("--drop-y", type=float, default=150.0, help="Drop point Y (mm)")
-    parser.add_argument("--drop-z", type=float, default=120.0, help="Drop transfer height Z (mm)")
-    parser.add_argument("--drop-release-z", type=float, default=90.0, help="Drop release height Z (mm)")
+    parser.add_argument("--drop-z", type=float, default=150.0, help="Drop transfer height Z (mm)")
+    parser.add_argument("--drop-release-z", type=float, default=100.0, help="Drop release height Z (mm)")
+    parser.add_argument("--post-open-lift-z", type=float, default=150.0, help="Z height after release-open before close (mm)")
+    parser.add_argument("--post-open-wait", type=float, default=3.0, help="Wait time after post-release lift before close (s)")
     parser.add_argument("--wait-at-drop", type=float, default=3.0, help="Wait at drop release height before release (s)")
     parser.add_argument("--cooldown", type=float, default=1.5, help="Global cooldown after sending a target (s)")
     parser.add_argument("--same-target-mm", type=float, default=20.0, help="Treat target as same if XY distance is within this threshold (mm)")

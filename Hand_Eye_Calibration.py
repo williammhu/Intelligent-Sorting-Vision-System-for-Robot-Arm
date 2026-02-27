@@ -69,7 +69,14 @@ class HomographyResult:
 
 
 class PlaneCalibrator:
-    def __init__(self, dictionary_name: str = DEFAULT_ARUCO_NAME):
+    def __init__(
+        self,
+        dictionary_name: str = DEFAULT_ARUCO_NAME,
+        camera_id: int = 2,
+        cam_width: int = 1280,
+        cam_height: int = 720,
+        cam_fps: int = 30,
+    ):
         if dictionary_name != "auto" and dictionary_name not in SUPPORTED_ARUCO_NAMES:
             raise ValueError(f"Unknown dictionary {dictionary_name}")
 
@@ -86,9 +93,21 @@ class PlaneCalibrator:
             self.detectors.append((name, marker_dict, self.aruco.ArucoDetector(marker_dict, self.parameters)))
 
         self.active_dict: Optional[str] = None
-        self.camera = cv2.VideoCapture(2, cv2.CAP_DSHOW)
+        self.camera = cv2.VideoCapture(camera_id, cv2.CAP_DSHOW)
         if not self.camera.isOpened():
-            raise RuntimeError("Failed to open camera index 2. Try index 0/1 and verify no other app is using it.")
+            raise RuntimeError(
+                f"Failed to open camera index {camera_id}. Try another index and verify no other app is using it."
+            )
+        self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, cam_width)
+        self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, cam_height)
+        self.camera.set(cv2.CAP_PROP_FPS, cam_fps)
+        actual_w = int(self.camera.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(self.camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        actual_fps = self.camera.get(cv2.CAP_PROP_FPS)
+        print(
+            f"[CAM] requested {cam_width}x{cam_height}@{cam_fps} -> got {actual_w}x{actual_h}@{actual_fps:.1f}",
+            flush=True,
+        )
 
     def read_frame(self) -> np.ndarray:
         ok, frame = self.camera.read()
@@ -296,13 +315,17 @@ def default_calibration_points(z_height: float) -> List[Tuple[float, float, floa
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Planar hand-eye calibration for Freenove arm + USB camera")
     parser.add_argument("--mode", choices=["calibrate", "follow"], required=True, help="Workflow to run")
+    parser.add_argument("--camera-id", type=int, default=2, help="OpenCV camera index")
+    parser.add_argument("--cam-width", type=int, default=1280, help="Requested camera width (pixels)")
+    parser.add_argument("--cam-height", type=int, default=720, help="Requested camera height (pixels)")
+    parser.add_argument("--cam-fps", type=int, default=30, help="Requested camera FPS")
     parser.add_argument("--z-height", type=float, default=90.0, help="Fixed Z height used for calibration and following (mm)")
     parser.add_argument("--host", type=str, default="10.149.65.232", help="Robot IP address")
     parser.add_argument("--port", type=int, default=5000, help="Robot TCP port (matches client.py default)")
     parser.add_argument("--dry-run", action="store_true", help="Print robot commands instead of sending them")
     parser.add_argument("--skip-enable", action="store_true", help="Do not send the S8 motor enable command on connect")
     parser.add_argument("--speed", type=int, default=50, help="Robot move speed hint (not all firmware uses this)")
-    parser.add_argument("--settle", type=float, default=5.0, help="Extra delay after robot reaches each calibration point (s)")
+    parser.add_argument("--settle", type=float, default=10.0, help="Extra delay after robot reaches each calibration point (s)")
     parser.add_argument(
         "--queue-timeout",
         type=float,
@@ -312,13 +335,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--capture-timeout",
         type=float,
-        default=6.0,
+        default=15.0,
         help="Timeout waiting for a stable marker at each point (s)",
     )
     parser.add_argument(
         "--stable-frames",
         type=int,
-        default=1,
+        default=0.5,
         help="Required consecutive stable marker detections before capture",
     )
     parser.add_argument(
@@ -361,7 +384,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    calibrator = PlaneCalibrator(dictionary_name=args.aruco_dict)
+    calibrator = PlaneCalibrator(
+        dictionary_name=args.aruco_dict,
+        camera_id=args.camera_id,
+        cam_width=args.cam_width,
+        cam_height=args.cam_height,
+        cam_fps=args.cam_fps,
+    )
 
     with FreenoveArmClient(
         host=args.host,
@@ -410,4 +439,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
