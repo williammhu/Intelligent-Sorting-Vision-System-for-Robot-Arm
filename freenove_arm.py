@@ -375,6 +375,42 @@ class FreenoveArmClient:
             f"{self._cmd.ARM_SERVO_ANGLE}{safe_angle}"
         )
 
+    def sweep_servo(
+        self,
+        index: int,
+        start_angle: float,
+        end_angle: float,
+        step_deg: float = 5.0,
+        step_delay_s: float = 0.08,
+    ) -> None:
+        """
+        Move a servo gradually by sending a sequence of small angle updates.
+
+        The Freenove TCP protocol exposes only absolute servo angle commands, so
+        slower motion must be approximated in the client.
+        """
+
+        start = max(0, min(180, int(round(start_angle))))
+        end = max(0, min(180, int(round(end_angle))))
+        step = max(1, int(round(abs(step_deg))))
+
+        if start == end:
+            self.set_servo(index, end)
+            return
+
+        direction = 1 if end > start else -1
+        current = start
+        self.set_servo(index, current)
+
+        while current != end:
+            next_angle = current + direction * step
+            if (direction > 0 and next_angle > end) or (direction < 0 and next_angle < end):
+                next_angle = end
+            self.set_servo(index, next_angle)
+            current = next_angle
+            if current != end and step_delay_s > 0:
+                time.sleep(step_delay_s)
+
     def beep(self, frequency_hz: int) -> None:
         """Play a buzzer tone (``S2 D..``)."""
 

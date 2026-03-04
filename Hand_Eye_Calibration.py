@@ -1,6 +1,8 @@
 """
 Planar hand-eye calibration script for the Freenove robot arm.
-
+树莓派终端输入：
+cd Freenove_Robot_Arm_Kit_for_Raspberry_Pi/Server/Code
+sudo python main.py
 This script estimates a 2D homography between camera pixels and robot XY
 coordinates using an ArUco/AprilTag marker attached to the gripper.
 python Hand_Eye_Calibration.py --mode calibrate --step

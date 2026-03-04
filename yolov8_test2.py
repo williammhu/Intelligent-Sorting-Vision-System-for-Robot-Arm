@@ -52,27 +52,6 @@ def pixel_to_robot(pixel: Sequence[float], homography: np.ndarray) -> Tuple[floa
     return float(mapped[0]), float(mapped[1])
 
 
-def estimate_bbox_size_mm(xyxy: Sequence[float], homography: np.ndarray) -> Tuple[float, float]:
-    """
-    Estimate planar object size (mm) from one detection box using homography.
-    Assumes the target lies on the calibrated plane.
-    """
-    x1, y1, x2, y2 = [float(v) for v in xyxy]
-    p_tl = pixel_to_robot((x1, y1), homography)
-    p_tr = pixel_to_robot((x2, y1), homography)
-    p_br = pixel_to_robot((x2, y2), homography)
-    p_bl = pixel_to_robot((x1, y2), homography)
-
-    def dist(a: Tuple[float, float], b: Tuple[float, float]) -> float:
-        dx = a[0] - b[0]
-        dy = a[1] - b[1]
-        return (dx * dx + dy * dy) ** 0.5
-
-    width_mm = 0.5 * (dist(p_tl, p_tr) + dist(p_bl, p_br))
-    height_mm = 0.5 * (dist(p_tl, p_bl) + dist(p_tr, p_br))
-    return width_mm, height_mm
-
-
 def select_best_box(result, allowed: Optional[Set[str]]) -> Optional[int]:
     """返回最高置信度的检测（可选类别过滤）。"""
     boxes = result.boxes
@@ -219,13 +198,7 @@ def robot_worker(
 
                 if state == "PRE_OPEN_BEFORE_TARGET":
                     print("[robot] step=pre_open_before_target (no wait)")
-                    arm.sweep_servo(
-                        GRIPPER_SERVO_INDEX,
-                        GRIPPER_CLOSE_ANGLE,
-                        GRIPPER_OPEN_ANGLE,
-                        step_deg=args.gripper_step_deg,
-                        step_delay_s=args.gripper_step_delay,
-                    )
+                    arm.set_servo(GRIPPER_SERVO_INDEX, GRIPPER_OPEN_ANGLE)
                     state = "MOVE_TO_TARGET"
                     command_sent = False
                     start_time = 0.0
@@ -255,14 +228,8 @@ def robot_worker(
                 if state == "GRIPPER_OPEN":
                     if not command_sent:
                         print(f"[robot] step=gripper_open wait_after_open={args.wait_after_open:.1f}s")
-                        arm.sweep_servo(
-                            GRIPPER_SERVO_INDEX,
-                            GRIPPER_OPEN_ANGLE,
-                            GRIPPER_OPEN_ANGLE,
-                            step_deg=args.gripper_step_deg,
-                            step_delay_s=args.gripper_step_delay,
-                        )
-                        start_time = time.time()
+                        arm.set_servo(GRIPPER_SERVO_INDEX, GRIPPER_OPEN_ANGLE)
+                        start_time = now
                         command_sent = True
                     if now - start_time >= args.gripper_wait:
                         state = "WAIT_OPEN"
@@ -282,14 +249,8 @@ def robot_worker(
                 if state == "GRIPPER_CLOSE":
                     if not command_sent:
                         print(f"[robot] step=gripper_close wait_after_close={args.wait_after_close:.1f}s")
-                        arm.sweep_servo(
-                            GRIPPER_SERVO_INDEX,
-                            GRIPPER_OPEN_ANGLE,
-                            GRIPPER_CLOSE_ANGLE,
-                            step_deg=args.gripper_step_deg,
-                            step_delay_s=args.gripper_step_delay,
-                        )
-                        start_time = time.time()
+                        arm.set_servo(GRIPPER_SERVO_INDEX, GRIPPER_CLOSE_ANGLE)
+                        start_time = now
                         command_sent = True
                     if now - start_time >= args.gripper_wait:
                         state = "WAIT_CLOSE"
@@ -356,14 +317,8 @@ def robot_worker(
                 if state == "RELEASE_OPEN":
                     if not command_sent:
                         print("[robot] step=release_open")
-                        arm.sweep_servo(
-                            GRIPPER_SERVO_INDEX,
-                            GRIPPER_CLOSE_ANGLE,
-                            GRIPPER_OPEN_ANGLE,
-                            step_deg=args.gripper_step_deg,
-                            step_delay_s=args.gripper_step_delay,
-                        )
-                        start_time = time.time()
+                        arm.set_servo(GRIPPER_SERVO_INDEX, GRIPPER_OPEN_ANGLE)
+                        start_time = now
                         command_sent = True
                     if now - start_time >= args.gripper_wait:
                         state = "POST_RELEASE_LIFT"
@@ -396,14 +351,8 @@ def robot_worker(
                 if state == "RELEASE_CLOSE":
                     if not command_sent:
                         print("[robot] step=release_close")
-                        arm.sweep_servo(
-                            GRIPPER_SERVO_INDEX,
-                            GRIPPER_OPEN_ANGLE,
-                            GRIPPER_CLOSE_ANGLE,
-                            step_deg=args.gripper_step_deg,
-                            step_delay_s=args.gripper_step_delay,
-                        )
-                        start_time = time.time()
+                        arm.set_servo(GRIPPER_SERVO_INDEX, GRIPPER_CLOSE_ANGLE)
+                        start_time = now
                         command_sent = True
                     if now - start_time >= args.gripper_wait:
                         state = "MOVE_HOME"
@@ -484,11 +433,11 @@ def detection_loop(args: argparse.Namespace) -> None:
     last_sent_code: Optional[str] = None
     last_printed_code: Optional[str] = None
     last_printed_time: float = 0.0
-    confirm_frames: int = 0
+    confirm_start_time: Optional[float] = None
     confirm_cls_id: Optional[int] = None
     confirm_xy: Optional[Tuple[float, float]] = None
     confirm_code: Optional[str] = None
-    confirm_size_mm: Optional[Tuple[float, float]] = None
+    confirm_duration_sec = 0.1
     confirm_conf_threshold = max(0.7, float(args.min_pick_conf))
 
     robot_thread = threading.Thread(
@@ -545,8 +494,6 @@ def detection_loop(args: argparse.Namespace) -> None:
                     cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 255), 2)
 
                     decoded_text: Optional[str] = None
-                    size_w_mm: Optional[float] = None
-                    size_h_mm: Optional[float] = None
                     x1c = max(0, min(x1, w - 1))
                     x2c = max(0, min(x2, w - 1))
                     y1c = max(0, min(y1, h - 1))
@@ -559,73 +506,59 @@ def detection_loop(args: argparse.Namespace) -> None:
                         decoded_text = decode_with_zxing(bw)
 
                         if decoded_text:
-                            size_w_mm, size_h_mm = estimate_bbox_size_mm(xyxy, homography)
                             now_print = time.time()
                             if decoded_text != last_printed_code or (now_print - last_printed_time) >= 1.0:
-                                print(
-                                    f"[ZXING] {decoded_text} | size={size_w_mm:.1f}x{size_h_mm:.1f}mm",
-                                    flush=True,
-                                )
+                                print(f"[ZXING] {decoded_text}", flush=True)
                                 last_printed_code = decoded_text
                                 last_printed_time = now_print
 
                     box_label = f"{cls_name} {conf:.2f}"
-                    if decoded_text and size_w_mm is not None and size_h_mm is not None:
-                        box_label = f"{box_label} | {decoded_text[:32]} | {size_w_mm:.1f}x{size_h_mm:.1f}mm"
+                    if decoded_text:
+                        box_label = f"{box_label} | {decoded_text[:50]}"
                     cv2.putText(
                         vis, box_label, (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2
                     )
 
-                    if decoded_text and size_w_mm is not None and size_h_mm is not None:
+                    if decoded_text:
                         cx = float((xyxy[0] + xyxy[2]) / 2.0)
                         cy = float((xyxy[1] + xyxy[3]) / 2.0)
                         rx, ry = pixel_to_robot((cx, cy), homography)
-                        decoded_candidates.append((conf, cls_id, rx, ry, decoded_text, size_w_mm, size_h_mm))
+                        decoded_candidates.append((conf, cls_id, rx, ry, decoded_text))
 
                 if decoded_candidates:
                     decoded_candidates.sort(key=lambda item: item[0], reverse=True)
-                    conf, cls_id, rx, ry, decoded_text, size_w_mm, size_h_mm = decoded_candidates[0]
+                    conf, cls_id, rx, ry, decoded_text = decoded_candidates[0]
 
                     if conf >= confirm_conf_threshold:
                         now = time.time()
                         if (
-                            confirm_frames > 0
+                            confirm_start_time is not None
                             and confirm_xy is not None
                             and confirm_cls_id is not None
                             and confirm_code is not None
-                            and confirm_size_mm is not None
                         ):
                             dx = rx - confirm_xy[0]
                             dy = ry - confirm_xy[1]
                             dist = (dx * dx + dy * dy) ** 0.5
-                            size_delta = max(
-                                abs(size_w_mm - confirm_size_mm[0]),
-                                abs(size_h_mm - confirm_size_mm[1]),
-                            )
                             same_candidate = (
                                 cls_id == confirm_cls_id
                                 and decoded_text == confirm_code
                                 and dist <= args.same_target_mm
-                                and size_delta <= args.size_stable_mm
                             )
                         else:
-                            same_candidate = False
+                            same_candidate = True
 
-                        if same_candidate:
-                            confirm_frames += 1
-                        else:
-                            confirm_frames = 1
+                        if confirm_start_time is None or not same_candidate:
+                            confirm_start_time = now
 
                         confirm_cls_id = cls_id
                         confirm_xy = (rx, ry)
                         confirm_code = decoded_text
-                        confirm_size_mm = (size_w_mm, size_h_mm)
+                        elapsed = now - confirm_start_time
+                        remaining = max(0.0, confirm_duration_sec - elapsed)
 
-                        if confirm_frames < args.confirm_frames:
-                            status = (
-                                f"Confirming {confirm_frames}/{args.confirm_frames} | "
-                                f"{size_w_mm:.1f}x{size_h_mm:.1f}mm"
-                            )
+                        if elapsed < confirm_duration_sec:
+                            status = f"Barcode confirming {remaining:.1f}s left"
                             status_color = (0, 255, 255)
                         else:
                             in_cooldown = last_sent_time is not None and (now - last_sent_time) < args.cooldown
@@ -660,33 +593,29 @@ def detection_loop(args: argparse.Namespace) -> None:
                                     status = "Queue full"
                                     status_color = (0, 255, 255)
 
-                            confirm_frames = 0
+                            confirm_start_time = None
                             confirm_cls_id = None
                             confirm_xy = None
                             confirm_code = None
-                            confirm_size_mm = None
                     else:
-                        confirm_frames = 0
+                        confirm_start_time = None
                         confirm_cls_id = None
                         confirm_xy = None
                         confirm_code = None
-                        confirm_size_mm = None
                         status = f"Low conf {conf:.2f}"
                         status_color = (0, 255, 255)
                 else:
-                    confirm_frames = 0
+                    confirm_start_time = None
                     confirm_cls_id = None
                     confirm_xy = None
                     confirm_code = None
-                    confirm_size_mm = None
                     status = "Barcode decode failed"
                     status_color = (0, 255, 255)
             else:
-                confirm_frames = 0
+                confirm_start_time = None
                 confirm_cls_id = None
                 confirm_xy = None
                 confirm_code = None
-                confirm_size_mm = None
 
             cv2.putText(vis, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
             cv2.imshow("yolo + hand-eye", vis)
@@ -712,8 +641,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--conf", type=float, default=0.7, help="YOLO detection confidence threshold")
     parser.add_argument("--imgsz", type=int, default=640, help="YOLO inference image size")
     parser.add_argument("--min-pick-conf", type=float, default=0.7, help="Minimum confidence to send a pick command")
-    parser.add_argument("--confirm-frames", type=int, default=3, help="Required stable decoded frames before sending a target")
-    parser.add_argument("--size-stable-mm", type=float, default=8.0, help="Max size delta (mm) between frames to count as stable")
     parser.add_argument("--classes", nargs="*", help="Optional class name filter for picking")
     parser.add_argument("--parms-dir", type=str, default="save_parms", help="Directory containing homography.npy")
     parser.add_argument("--z-height", type=float, default=90.0, help="Table Z height for picking (mm)")
@@ -748,8 +675,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gripper-servo-index", type=int, default=GRIPPER_SERVO_INDEX, help="Gripper servo index")
     parser.add_argument("--gripper-open", type=int, default=GRIPPER_OPEN_ANGLE, help="Gripper open angle")
     parser.add_argument("--gripper-close", type=int, default=GRIPPER_CLOSE_ANGLE, help="Gripper close angle")
-    parser.add_argument("--gripper-step-deg", type=float, default=5.0, help="Servo angle step used for slow open/close motion")
-    parser.add_argument("--gripper-step-delay", type=float, default=0.12, help="Delay between servo angle steps (s)")
     parser.add_argument("--gripper-wait", type=float, default=3.0, help="Wait after gripper open/close command (s)")
     parser.add_argument("--wait-at-target", type=float, default=3.0, help="Wait at target after arriving (s)")
     parser.add_argument("--wait-after-open", type=float, default=3.0, help="Wait after gripper open (s)")
