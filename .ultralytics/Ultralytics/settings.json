@@ -1,0 +1,21 @@
+{
+  "settings_version": "0.0.6",
+  "datasets_dir": "D:\\Eye-Hand-Calibration\\datasets",
+  "weights_dir": "weights",
+  "runs_dir": "runs",
+  "uuid": "8a34c347de7bed621672e903180aea458ef23bbd40c8b69558e4f905a68cdcbe",
+  "sync": true,
+  "api_key": "",
+  "openai_api_key": "",
+  "clearml": true,
+  "comet": true,
+  "dvc": true,
+  "hub": true,
+  "mlflow": true,
+  "neptune": true,
+  "raytune": true,
+  "tensorboard": false,
+  "wandb": false,
+  "vscode_msg": true,
+  "openvino_msg": true
+}
