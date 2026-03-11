@@ -1,4 +1,4 @@
-# Freenove 机械臂的眼手标定
+# Intelligent Sorting Vision System for Robot Arm
 
 ## 概述
 

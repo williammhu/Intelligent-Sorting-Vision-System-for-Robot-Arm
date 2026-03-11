@@ -1,4 +1,4 @@
-# Eye-Hand Calibration for the Freenove Robot Arm
+# Intelligent Sorting Vision System for Robot Arm
 
 ## Overview
 
