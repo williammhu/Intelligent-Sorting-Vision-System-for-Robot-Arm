@@ -1,5 +1,5 @@
 import socket
-from freenove_source_code import messageQueue
+import messageQueue
 
 
 class Client:
