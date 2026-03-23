@@ -695,7 +695,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--calib-x", type=float, default=None, help="(Deprecated) alias for --home-x")
     parser.add_argument("--calib-y", type=float, default=None, help="(Deprecated) alias for --home-y")
     parser.add_argument("--calib-z", type=float, default=None, help="(Deprecated) alias for --home-z")
-    parser.add_argument("--host", type=str, default="10.149.65.232", help="Robot IP address")
+    parser.add_argument("--host", type=str, default="10.149.70.8", help="Robot IP address")
     parser.add_argument("--port", type=int, default=5000, help="Robot TCP port")
     parser.add_argument("--dry-run", action="store_true", help="Print commands instead of sending to robot")
     parser.add_argument("--skip-enable", action="store_true", help="Do not send motor enable command on connect")

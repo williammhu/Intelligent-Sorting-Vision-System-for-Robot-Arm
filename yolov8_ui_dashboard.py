@@ -22,7 +22,7 @@ from ultralytics import YOLO
 
 from Hand_Eye_Calibration import HomographyResult
 from freenove_arm import FreenoveArmClient
-from yolov8_test1 import decode_with_zxing, estimate_bbox_size_mm, pixel_to_robot
+from yolov8_test1 import decode_with_zxing, estimate_bbox_size_cm, pixel_to_robot
 
 
 GRIPPER_SERVO_INDEX = 0
@@ -544,7 +544,7 @@ def vision_worker(
                         _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
                         decoded_text = decode_with_zxing(bw)
                         if decoded_text:
-                            size_w_mm, size_h_mm = estimate_bbox_size_mm(xyxy, homography)
+                            size_w_mm, size_h_mm = estimate_bbox_size_cm(xyxy, homography)
 
                     label = f"{cls_name} {conf:.2f}"
                     if decoded_text and size_w_mm is not None and size_h_mm is not None:
@@ -1008,7 +1008,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--calib-x", type=float, default=None, help="Deprecated alias for --home-x")
     parser.add_argument("--calib-y", type=float, default=None, help="Deprecated alias for --home-y")
     parser.add_argument("--calib-z", type=float, default=None, help="Deprecated alias for --home-z")
-    parser.add_argument("--host", type=str, default="10.149.65.232", help="Robot IP address")
+    parser.add_argument("--host", type=str, default="10.149.70.8", help="Robot IP address")
     parser.add_argument("--port", type=int, default=5000, help="Robot TCP port")
     parser.add_argument("--dry-run", action="store_true", help="Print commands instead of sending them")
     parser.add_argument("--skip-enable", action="store_true", help="Do not enable motors on connect")
