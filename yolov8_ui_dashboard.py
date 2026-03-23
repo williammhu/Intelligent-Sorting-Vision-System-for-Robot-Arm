@@ -8,7 +8,7 @@ import time
 import tkinter as tk
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Deque, Optional, Sequence, Tuple
+from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -42,7 +42,9 @@ class DashboardState:
     vision_status: str = "Starting vision pipeline"
     vision_status_kind: str = "busy"
     decoded_text: str = "N/A"
+    decoded_text_second: str = "N/A"
     size_text: str = "N/A"
+    size_text_second: str = "N/A"
     class_text: str = "N/A"
     target_text: str = "N/A"
     camera_text: str = "Initializing camera"
@@ -72,7 +74,9 @@ class DashboardState:
         self,
         *,
         decoded_text: Optional[str] = None,
+        decoded_text_second: Optional[str] = None,
         size_text: Optional[str] = None,
+        size_text_second: Optional[str] = None,
         class_text: Optional[str] = None,
         target_text: Optional[str] = None,
         confirm_text: Optional[str] = None,
@@ -81,8 +85,12 @@ class DashboardState:
         with self.lock:
             if decoded_text is not None:
                 self.decoded_text = decoded_text
+            if decoded_text_second is not None:
+                self.decoded_text_second = decoded_text_second
             if size_text is not None:
                 self.size_text = size_text
+            if size_text_second is not None:
+                self.size_text_second = size_text_second
             if class_text is not None:
                 self.class_text = class_text
             if target_text is not None:
@@ -102,7 +110,9 @@ class DashboardState:
                 "vision_status": self.vision_status,
                 "vision_status_kind": self.vision_status_kind,
                 "decoded_text": self.decoded_text,
+                "decoded_text_second": self.decoded_text_second,
                 "size_text": self.size_text,
+                "size_text_second": self.size_text_second,
                 "class_text": self.class_text,
                 "target_text": self.target_text,
                 "camera_text": self.camera_text,
@@ -125,7 +135,7 @@ def update_robot_card(state: DashboardState, fsm_state: str, message: str, kind:
 def robot_worker_ui(
     args: argparse.Namespace,
     state: DashboardState,
-    target_queue: "queue.Queue[Optional[Tuple[float, float, float, int]]]",
+    target_queue: "queue.Queue",
     busy_flag: threading.Event,
     done_flag: threading.Event,
     stop_event: threading.Event,
@@ -179,12 +189,11 @@ def robot_worker_ui(
 
             home_point = (args.home_x, args.home_y, args.home_z)
             drop_point = (args.drop_x, args.drop_y, args.drop_z)
-            drop_release_point = (args.drop_x, args.drop_y, args.drop_release_z)
             drop_post_open_lift_point = (args.drop_x, args.drop_y, args.post_open_lift_z)
             tick = 0.02
             command_sent = False
             start_time = 0.0
-            current_target: Optional[Tuple[float, float, float, int]] = None
+            current_target: Optional[Tuple[float, float, float, int, float]] = None
             fsm_state = "IDLE"
             state.set_robot_state("IDLE", "Waiting for target", "idle")
 
@@ -211,7 +220,11 @@ def robot_worker_ui(
                     busy_flag.clear()
                     continue
 
-                x, y, z, _cls_id = current_target
+                if len(current_target) >= 5:
+                    x, y, z, _cls_id, current_drop_release_z = current_target
+                else:
+                    x, y, z, _cls_id = current_target
+                    current_drop_release_z = args.drop_release_z
 
                 if fsm_state == "PRE_OPEN_BEFORE_TARGET":
                     arm.sweep_servo(
@@ -326,14 +339,14 @@ def robot_worker_ui(
 
                 if fsm_state == "MOVE_TO_DROP_RELEASE_Z":
                     if not command_sent:
-                        arm.move_to(*drop_release_point, speed=args.speed)
+                        arm.move_to(args.drop_x, args.drop_y, current_drop_release_z, speed=args.speed)
                         start_time = now
                         command_sent = True
                     if move_phase_done(start_time):
                         fsm_state = "WAIT_DROP_RELEASE"
                         command_sent = False
                         start_time = now
-                        update_robot_card(state, fsm_state, "Holding release position")
+                        update_robot_card(state, fsm_state, f"Holding release position Z={current_drop_release_z:.1f}")
                     arm.wait(tick)
                     continue
 
@@ -440,7 +453,7 @@ def robot_worker_ui(
 def vision_worker(
     args: argparse.Namespace,
     state: DashboardState,
-    target_queue: "queue.Queue[Optional[Tuple[float, float, float, int]]]",
+    target_queue: "queue.Queue",
     busy_flag: threading.Event,
     done_flag: threading.Event,
     stop_event: threading.Event,
@@ -475,15 +488,10 @@ def vision_worker(
     state.push_event(f"Camera ready: {actual_w}x{actual_h}@{actual_fps:.1f}")
 
     allowed = set(args.classes) if args.classes else None
-    last_sent_time: Optional[float] = None
-    last_sent_xy: Optional[Tuple[float, float]] = None
-    last_sent_code: Optional[str] = None
-    confirm_frames = 0
-    confirm_cls_id: Optional[int] = None
-    confirm_xy: Optional[Tuple[float, float]] = None
-    confirm_code: Optional[str] = None
-    confirm_size_mm: Optional[Tuple[float, float]] = None
+    recent_sent_targets: List[Tuple[float, float, float, str]] = []
+    confirm_states: Dict[Tuple[int, str], Dict[str, Any]] = {}
     confirm_conf_threshold = max(0.7, float(args.min_pick_conf))
+    round_target_count = 0
 
     try:
         while not stop_event.is_set():
@@ -517,6 +525,11 @@ def vision_worker(
             if boxes is not None and len(boxes) > 0:
                 h, w = frame.shape[:2]
                 decoded_candidates = []
+                now = time.time()
+                detected_box_count = 0
+                recent_sent_targets = [
+                    item for item in recent_sent_targets if (now - item[0]) <= args.same_target_sec
+                ]
 
                 for i in range(len(boxes)):
                     cls_id = int(boxes.cls[i])
@@ -524,14 +537,15 @@ def vision_worker(
                     cls_name = result.names[cls_id]
                     if allowed and cls_name not in allowed:
                         continue
+                    detected_box_count += 1
 
                     xyxy = boxes.xyxy[i].cpu().numpy()
                     x1, y1, x2, y2 = [int(v) for v in xyxy]
                     cv2.rectangle(vis, (x1, y1), (x2, y2), (44, 166, 255), 2)
 
                     decoded_text: Optional[str] = None
-                    size_w_mm: Optional[float] = None
-                    size_h_mm: Optional[float] = None
+                    size_w_cm: Optional[float] = None
+                    size_h_cm: Optional[float] = None
 
                     x1c = max(0, min(x1, w - 1))
                     x2c = max(0, min(x2, w - 1))
@@ -544,11 +558,11 @@ def vision_worker(
                         _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
                         decoded_text = decode_with_zxing(bw)
                         if decoded_text:
-                            size_w_mm, size_h_mm = estimate_bbox_size_cm(xyxy, homography)
+                            size_w_cm, size_h_cm = estimate_bbox_size_cm(xyxy, homography)
 
                     label = f"{cls_name} {conf:.2f}"
-                    if decoded_text and size_w_mm is not None and size_h_mm is not None:
-                        label = f"{label} | {decoded_text[:24]} | {size_w_mm:.1f}x{size_h_mm:.1f}mm"
+                    if decoded_text and size_w_cm is not None and size_h_cm is not None:
+                        label = f"{label} | {decoded_text[:24]} | {size_w_cm:.1f}x{size_h_cm:.1f}cm"
                     cv2.putText(
                         vis,
                         label,
@@ -560,135 +574,208 @@ def vision_worker(
                         cv2.LINE_AA,
                     )
 
-                    if decoded_text and size_w_mm is not None and size_h_mm is not None:
+                    if decoded_text and size_w_cm is not None and size_h_cm is not None:
                         cx = float((xyxy[0] + xyxy[2]) / 2.0)
                         cy = float((xyxy[1] + xyxy[3]) / 2.0)
                         rx, ry = pixel_to_robot((cx, cy), homography)
-                        decoded_candidates.append((conf, cls_id, cls_name, rx, ry, decoded_text, size_w_mm, size_h_mm))
+                        decoded_candidates.append((conf, cls_id, cls_name, rx, ry, decoded_text, size_w_cm, size_h_cm))
+
+                if round_target_count == 0 and detected_box_count > 0:
+                    round_target_count = 1 if detected_box_count == 1 else 2
+                    state.push_event(f"Round locked: {round_target_count} target(s)")
 
                 if decoded_candidates:
-                    decoded_candidates.sort(key=lambda item: item[0], reverse=True)
-                    conf, cls_id, cls_name, rx, ry, decoded_text, size_w_mm, size_h_mm = decoded_candidates[0]
+                    display_candidates = sorted(decoded_candidates, key=lambda item: (item[6] * item[7], item[0]), reverse=True)
+                    primary = display_candidates[0]
+                    secondary = display_candidates[1] if len(display_candidates) > 1 else None
+                    conf, cls_id, cls_name, rx, ry, decoded_text, size_w_cm, size_h_cm = primary
                     state.set_detection_info(
                         decoded_text=decoded_text,
-                        size_text=f"{size_w_mm:.1f} x {size_h_mm:.1f} mm",
+                        decoded_text_second=secondary[5] if secondary is not None else "N/A",
+                        size_text=f"{size_w_cm:.1f} x {size_h_cm:.1f} cm",
+                        size_text_second=(
+                            f"{secondary[6]:.1f} x {secondary[7]:.1f} cm"
+                            if secondary is not None
+                            else "N/A"
+                        ),
                         class_text=f"{cls_name}  ({conf:.2f})",
                         target_text=f"X={rx:.1f} mm, Y={ry:.1f} mm, Z={args.pick_z:.1f} mm",
                     )
 
-                    if conf >= confirm_conf_threshold:
-                        now = time.time()
-                        if (
-                            confirm_frames > 0
-                            and confirm_xy is not None
-                            and confirm_cls_id is not None
-                            and confirm_code is not None
-                            and confirm_size_mm is not None
-                        ):
-                            dx = rx - confirm_xy[0]
-                            dy = ry - confirm_xy[1]
-                            dist = (dx * dx + dy * dy) ** 0.5
-                            size_delta = max(
-                                abs(size_w_mm - confirm_size_mm[0]),
-                                abs(size_h_mm - confirm_size_mm[1]),
-                            )
-                            same_candidate = (
-                                cls_id == confirm_cls_id
-                                and decoded_text == confirm_code
-                                and dist <= args.same_target_mm
-                                and size_delta <= args.size_stable_mm
-                            )
-                        else:
+                    high_conf_candidates = [item for item in decoded_candidates if item[0] >= confirm_conf_threshold]
+
+                    if high_conf_candidates:
+                        seen_keys = set()
+                        confirmed_candidates = []
+
+                        for conf, cls_id, cls_name, rx, ry, decoded_text, size_w_cm, size_h_cm in high_conf_candidates:
+                            key = (cls_id, decoded_text)
+                            seen_keys.add(key)
+                            prev_state = confirm_states.get(key)
+
                             same_candidate = False
-
-                        confirm_frames = confirm_frames + 1 if same_candidate else 1
-                        confirm_cls_id = cls_id
-                        confirm_xy = (rx, ry)
-                        confirm_code = decoded_text
-                        confirm_size_mm = (size_w_mm, size_h_mm)
-
-                        if confirm_frames < args.confirm_frames:
-                            status = f"Confirming target {confirm_frames}/{args.confirm_frames}"
-                            status_kind = "warn"
-                            status_color = (33, 179, 217)
-                            state.set_detection_info(confirm_text=f"Stability check: {confirm_frames}/{args.confirm_frames}")
-                        else:
-                            in_cooldown = last_sent_time is not None and (now - last_sent_time) < args.cooldown
-                            same_recent = False
-                            if last_sent_time is not None and last_sent_xy is not None:
-                                dt = now - last_sent_time
-                                dx = rx - last_sent_xy[0]
-                                dy = ry - last_sent_xy[1]
+                            if prev_state is not None:
+                                prev_xy = prev_state["xy"]
+                                prev_size = prev_state["size"]
+                                dx = rx - prev_xy[0]
+                                dy = ry - prev_xy[1]
                                 dist = (dx * dx + dy * dy) ** 0.5
-                                same_recent = (
-                                    dt <= args.same_target_sec
-                                    and dist <= args.same_target_mm
-                                    and last_sent_code == decoded_text
+                                size_delta = max(
+                                    abs(size_w_cm - prev_size[0]),
+                                    abs(size_h_cm - prev_size[1]),
+                                )
+                                same_candidate = (
+                                    dist <= args.same_target_mm
+                                    and size_delta <= args.size_stable_mm
                                 )
 
-                            if in_cooldown:
-                                remaining_cd = args.cooldown - (now - last_sent_time)
-                                status = f"Cooldown {max(0.0, remaining_cd):.1f}s"
+                            frames = int(prev_state["frames"]) + 1 if same_candidate and prev_state is not None else 1
+                            confirm_states[key] = {
+                                "frames": frames,
+                                "xy": (rx, ry),
+                                "size": (size_w_cm, size_h_cm),
+                            }
+
+                            if frames >= args.confirm_frames:
+                                confirmed_candidates.append(
+                                    (conf, cls_id, cls_name, rx, ry, decoded_text, size_w_cm, size_h_cm)
+                                )
+
+                        confirm_states = {key: confirm_states[key] for key in seen_keys}
+
+                        if confirmed_candidates:
+                            required_decode_count = round_target_count if round_target_count > 0 else 1
+                            if len(confirmed_candidates) < required_decode_count:
+                                status = f"Waiting decode {len(confirmed_candidates)}/{required_decode_count}"
                                 status_kind = "warn"
                                 status_color = (33, 179, 217)
-                                state.set_detection_info(confirm_text="Waiting for cooldown to finish")
-                            elif same_recent:
-                                status = "Duplicate target skipped"
-                                status_kind = "warn"
-                                status_color = (33, 179, 217)
-                                state.set_detection_info(confirm_text="Duplicate target filtered")
+                                state.set_detection_info(
+                                    confirm_text=f"Round lock: waiting decode {len(confirmed_candidates)}/{required_decode_count}"
+                                )
                             else:
-                                try:
-                                    target_queue.put_nowait((rx, ry, args.pick_z, cls_id))
-                                    busy_flag.set()
-                                    last_sent_time = now
-                                    last_sent_xy = (rx, ry)
-                                    last_sent_code = decoded_text
-                                    status = "Target sent to robot"
-                                    status_kind = "ok"
-                                    status_color = (15, 157, 88)
-                                    state.push_event(f"Target queued: {decoded_text} @ X={rx:.1f}, Y={ry:.1f}")
-                                    state.set_detection_info(confirm_text="Target accepted")
-                                except queue.Full:
-                                    status = "Robot queue is full"
+                                confirmed_candidates.sort(key=lambda item: (item[6] * item[7], item[0]), reverse=True)
+                                send_limit = min(required_decode_count, len(confirmed_candidates))
+                                targets_to_send = []
+
+                                for send_index, candidate in enumerate(confirmed_candidates[:send_limit]):
+                                    (
+                                        conf,
+                                        cls_id,
+                                        cls_name,
+                                        rx,
+                                        ry,
+                                        decoded_text,
+                                        size_w_cm,
+                                        size_h_cm,
+                                    ) = candidate
+                                    same_recent = False
+                                    for sent_time, sent_x, sent_y, sent_code in recent_sent_targets:
+                                        dt = now - sent_time
+                                        dx = rx - sent_x
+                                        dy = ry - sent_y
+                                        dist = (dx * dx + dy * dy) ** 0.5
+                                        if (
+                                            dt <= args.same_target_sec
+                                            and dist <= args.same_target_mm
+                                            and sent_code == decoded_text
+                                        ):
+                                            same_recent = True
+                                            break
+
+                                    if not same_recent:
+                                        drop_release_z = (
+                                            args.drop_release_z_second
+                                            if required_decode_count == 2 and send_index == 1
+                                            else args.drop_release_z
+                                        )
+                                        targets_to_send.append(
+                                            (rx, ry, args.pick_z, cls_id, drop_release_z, decoded_text)
+                                        )
+
+                                if len(targets_to_send) == required_decode_count:
+                                    sent_count = 0
+                                    try:
+                                        for rx, ry, pick_z, cls_id, drop_release_z, decoded_text in targets_to_send:
+                                            target_queue.put_nowait((rx, ry, pick_z, cls_id, drop_release_z))
+                                            recent_sent_targets.append((now, rx, ry, decoded_text))
+                                            confirm_states.pop((cls_id, decoded_text), None)
+                                            sent_count += 1
+                                    except queue.Full:
+                                        status = "Robot queue is full"
+                                        status_kind = "warn"
+                                        status_color = (33, 179, 217)
+                                        state.set_detection_info(confirm_text="Queue is full, waiting")
+                                        sent_count = 0
+
+                                    if sent_count == required_decode_count:
+                                        busy_flag.set()
+                                        status = f"Round queued ({sent_count})"
+                                        status_kind = "ok"
+                                        status_color = (15, 157, 88)
+                                        state.push_event(f"Round queued: {sent_count} target(s)")
+                                        state.set_detection_info(confirm_text=f"Round accepted: {sent_count} target(s)")
+                                        round_target_count = 0
+                                        confirm_states.clear()
+                                    else:
+                                        status = "Round send incomplete"
+                                        status_kind = "warn"
+                                        status_color = (33, 179, 217)
+                                        state.set_detection_info(confirm_text="Round blocked before enqueue")
+                                else:
+                                    status = "Duplicate target skipped"
                                     status_kind = "warn"
                                     status_color = (33, 179, 217)
-                                    state.set_detection_info(confirm_text="Queue is full, waiting")
-
-                            confirm_frames = 0
-                            confirm_cls_id = None
-                            confirm_xy = None
-                            confirm_code = None
-                            confirm_size_mm = None
+                                    state.set_detection_info(confirm_text="Round blocked by duplicate filter")
+                        else:
+                            max_frames = max(int(confirm_states[key]["frames"]) for key in seen_keys)
+                            if round_target_count >= 2:
+                                status = f"Waiting decode 0/{round_target_count}"
+                                state.set_detection_info(confirm_text=f"Round lock: waiting decode 0/{round_target_count}")
+                            else:
+                                status = f"Confirming target {max_frames}/{args.confirm_frames}"
+                                state.set_detection_info(confirm_text=f"Stability check: {max_frames}/{args.confirm_frames}")
+                            status_kind = "warn"
+                            status_color = (33, 179, 217)
                     else:
-                        confirm_frames = 0
-                        confirm_cls_id = None
-                        confirm_xy = None
-                        confirm_code = None
-                        confirm_size_mm = None
-                        status = f"Low confidence {conf:.2f}"
+                        if round_target_count >= 2:
+                            status = f"Waiting decode 0/{round_target_count}"
+                            state.set_detection_info(confirm_text=f"Round lock: waiting decode 0/{round_target_count}")
+                        else:
+                            confirm_states.clear()
+                            status = f"Low confidence {conf:.2f}"
+                            state.set_detection_info(confirm_text="Confidence below pick threshold")
                         status_kind = "warn"
                         status_color = (33, 179, 217)
-                        state.set_detection_info(confirm_text="Confidence below pick threshold")
                 else:
-                    confirm_frames = 0
-                    confirm_cls_id = None
-                    confirm_xy = None
-                    confirm_code = None
-                    confirm_size_mm = None
-                    status = "Barcode decode failed"
+                    if round_target_count >= 2:
+                        status = f"Waiting decode 0/{round_target_count}"
+                        state.set_detection_info(
+                            decoded_text="N/A",
+                            decoded_text_second="N/A",
+                            size_text="N/A",
+                            size_text_second="N/A",
+                            confirm_text=f"Round lock: waiting decode 0/{round_target_count}",
+                        )
+                    else:
+                        confirm_states.clear()
+                        status = "Barcode decode failed"
+                        state.set_detection_info(
+                            decoded_text="N/A",
+                            decoded_text_second="N/A",
+                            size_text="N/A",
+                            size_text_second="N/A",
+                            confirm_text="Detection exists, but decode failed",
+                        )
                     status_kind = "warn"
                     status_color = (33, 179, 217)
-                    state.set_detection_info(confirm_text="Detection exists, but decode failed")
             else:
-                confirm_frames = 0
-                confirm_cls_id = None
-                confirm_xy = None
-                confirm_code = None
-                confirm_size_mm = None
+                confirm_states.clear()
+                round_target_count = 0
                 state.set_detection_info(
                     decoded_text="N/A",
+                    decoded_text_second="N/A",
                     size_text="N/A",
+                    size_text_second="N/A",
                     class_text="N/A",
                     target_text="N/A",
                     confirm_text="No object candidate",
@@ -708,7 +795,7 @@ class YoloDashboardApp:
         self.stop_event = threading.Event()
         self.busy_flag = threading.Event()
         self.done_flag = threading.Event()
-        self.target_queue: "queue.Queue[Optional[Tuple[float, float, float, int]]]" = queue.Queue(maxsize=1)
+        self.target_queue: "queue.Queue" = queue.Queue(maxsize=8)
         self.video_image: Optional[ImageTk.PhotoImage] = None
 
         self.root = tk.Tk()
@@ -830,22 +917,19 @@ class YoloDashboardApp:
         self.decode_card = self._create_card(right)
         self.decode_card.grid(row=1, column=0, sticky="ew", pady=(0, 10))
         self._card_title(self.decode_card, "Decode Result", "ZXing-decoded content")
-        self.decode_value = tk.Label(
-            self.decode_card,
-            text="N/A",
-            bg="#FFFFFF",
-            fg="#163246",
-            justify="left",
-            wraplength=280,
-            font=("Consolas", 11),
-        )
-        self.decode_value.grid(row=2, column=0, sticky="w", padx=18, pady=(4, 14))
+        self.decode_value = self._metric(self.decode_card, "Decode Result 1", "N/A")
+        self.decode_value.configure(font=("Consolas", 10))
+        self.decode_value.configure(wraplength=280, justify="left")
+        self.decode_second_value = self._metric(self.decode_card, "Decode Result 2", "N/A")
+        self.decode_second_value.configure(font=("Consolas", 10))
+        self.decode_second_value.configure(wraplength=280, justify="left")
 
         self.metrics_card = self._create_card(right)
         self.metrics_card.grid(row=2, column=0, sticky="ew", pady=(0, 10))
         self._card_title(self.metrics_card, "Measurement", "Class, confidence, size, and target pose")
         self.class_value = self._metric(self.metrics_card, "Object", "N/A")
-        self.size_value = self._metric(self.metrics_card, "Estimated Size", "N/A")
+        self.size_value = self._metric(self.metrics_card, "Estimated Size 1", "N/A")
+        self.size_second_value = self._metric(self.metrics_card, "Estimated Size 2", "N/A")
         self.target_value = self._metric(self.metrics_card, "Robot Target", "N/A")
 
     def _create_card(self, parent: tk.Widget) -> tk.Frame:
@@ -899,8 +983,10 @@ class YoloDashboardApp:
         snap = self.state.snapshot()
         self._update_video(snap["latest_frame"])
         self._set_text(self.decode_value, snap["decoded_text"])
+        self._set_text(self.decode_second_value, snap["decoded_text_second"])
         self._set_text(self.class_value, snap["class_text"])
         self._set_text(self.size_value, snap["size_text"])
+        self._set_text(self.size_second_value, snap["size_text_second"])
         self._set_text(self.target_value, snap["target_text"])
         self._set_text(self.camera_value, snap["camera_text"])
         self._set_text(self.vision_value, snap["vision_status"])
@@ -992,10 +1078,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wait-at-target", type=float, default=3.0, help="Wait after arriving at target")
     parser.add_argument("--wait-after-open", type=float, default=3.0, help="Wait after gripper open")
     parser.add_argument("--wait-after-close", type=float, default=3.0, help="Wait after gripper close")
-    parser.add_argument("--drop-x", type=float, default=100.0, help="Drop point X")
+    parser.add_argument("--drop-x", type=float, default=-100.0, help="Drop point X")
     parser.add_argument("--drop-y", type=float, default=150.0, help="Drop point Y")
-    parser.add_argument("--drop-z", type=float, default=150.0, help="Drop transfer height Z")
+    parser.add_argument("--drop-z", type=float, default=160.0, help="Drop transfer height Z")
     parser.add_argument("--drop-release-z", type=float, default=100.0, help="Drop release height Z")
+    parser.add_argument(
+        "--drop-release-z-second",
+        type=float,
+        default=130.0,
+        help="Drop release height Z for the second target in a two-target round",
+    )
     parser.add_argument("--post-open-lift-z", type=float, default=150.0, help="Z height after release-open")
     parser.add_argument("--post-open-wait", type=float, default=3.0, help="Wait after post-release lift")
     parser.add_argument("--wait-at-drop", type=float, default=3.0, help="Wait at drop release height")
