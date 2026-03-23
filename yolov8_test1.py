@@ -24,7 +24,7 @@ import queue
 import threading
 import tempfile
 import time
-from typing import Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import cv2
 import numpy as np
@@ -481,9 +481,10 @@ def detection_loop(args: argparse.Namespace) -> None:
     done_flag = threading.Event()
     last_printed_code: Optional[str] = None
     last_printed_time: float = 0.0
-    confirm_states: dict[Tuple[int, str], dict[str, object]] = {}
-    recent_sent_targets: list[Tuple[float, float, float, str]] = []
+    confirm_states: Dict[Tuple[int, str], Dict[str, Any]] = {}
+    recent_sent_targets: List[Tuple[float, float, float, str]] = []
     confirm_conf_threshold = max(0.6, float(args.min_pick_conf))
+    pending_required_decode_count = 0
 
     robot_thread = threading.Thread(
         target=robot_worker,
@@ -527,6 +528,7 @@ def detection_loop(args: argparse.Namespace) -> None:
                 h, w = frame.shape[:2]
                 decoded_candidates = []
                 now = time.time()
+                detected_box_count = 0
                 recent_sent_targets = [
                     item for item in recent_sent_targets if (now - item[0]) <= args.same_target_sec
                 ]
@@ -537,6 +539,7 @@ def detection_loop(args: argparse.Namespace) -> None:
                     cls_name = result.names[cls_id]
                     if allowed and cls_name not in allowed:
                         continue
+                    detected_box_count += 1
 
                     xyxy = boxes.xyxy[i].cpu().numpy()
                     x1, y1, x2, y2 = [int(v) for v in xyxy]
@@ -580,6 +583,11 @@ def detection_loop(args: argparse.Namespace) -> None:
                         rx, ry = pixel_to_robot((cx, cy), homography)
                         decoded_candidates.append((conf, cls_id, cls_name, rx, ry, decoded_text, size_w_cm, size_h_cm))
 
+                if detected_box_count >= 2:
+                    pending_required_decode_count = max(pending_required_decode_count, detected_box_count)
+                elif detected_box_count == 0:
+                    pending_required_decode_count = 0
+
                 if decoded_candidates:
                     high_conf_candidates = [item for item in decoded_candidates if item[0] >= confirm_conf_threshold]
 
@@ -622,10 +630,22 @@ def detection_loop(args: argparse.Namespace) -> None:
                         confirm_states = {key: confirm_states[key] for key in seen_keys}
 
                         if confirmed_candidates:
+                            required_decode_count = pending_required_decode_count if pending_required_decode_count >= 2 else 1
+
+                            if len(confirmed_candidates) < required_decode_count:
+                                status = f"Waiting decode {len(confirmed_candidates)}/{required_decode_count}"
+                                status_color = (0, 255, 255)
+                                cv2.putText(vis, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
+                                cv2.imshow("yolo + hand-eye", vis)
+                                if (cv2.waitKey(1) & 0xFF) == ord("q"):
+                                    break
+                                continue
+
                             confirmed_candidates.sort(key=lambda item: (item[6] * item[7], item[0]), reverse=True)
                             sent_count = 0
+                            send_limit = min(required_decode_count, len(confirmed_candidates))
 
-                            for candidate in confirmed_candidates:
+                            for candidate in confirmed_candidates[:send_limit]:
                                 (
                                     conf,
                                     cls_id,
@@ -663,24 +683,35 @@ def detection_loop(args: argparse.Namespace) -> None:
                             if sent_count > 0:
                                 busy_flag.set()
                                 status = f"Targets sent {sent_count}"
+                                pending_required_decode_count = 0
                             else:
                                 status = "Dedup skip"
                                 status_color = (0, 255, 255)
                         else:
                             max_frames = max(int(confirm_states[key]["frames"]) for key in seen_keys)
-                            status = f"Confirming {len(seen_keys)} target(s) {max_frames}/{args.confirm_frames}"
+                            if pending_required_decode_count >= 2:
+                                status = f"Waiting decode 0/{pending_required_decode_count}"
+                            else:
+                                status = f"Confirming {len(seen_keys)} target(s) {max_frames}/{args.confirm_frames}"
                             status_color = (0, 255, 255)
                     else:
-                        confirm_states.clear()
                         best_conf = max(item[0] for item in decoded_candidates)
-                        status = f"Low conf {best_conf:.2f}"
+                        if pending_required_decode_count >= 2:
+                            status = f"Waiting decode 0/{pending_required_decode_count}"
+                        else:
+                            confirm_states.clear()
+                            status = f"Low conf {best_conf:.2f}"
                         status_color = (0, 255, 255)
                 else:
-                    confirm_states.clear()
-                    status = "Barcode decode failed"
+                    if pending_required_decode_count >= 2:
+                        status = f"Waiting decode 0/{pending_required_decode_count}"
+                    else:
+                        confirm_states.clear()
+                        status = "Barcode decode failed"
                     status_color = (0, 255, 255)
             else:
                 confirm_states.clear()
+                pending_required_decode_count = 0
 
             cv2.putText(vis, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
             cv2.imshow("yolo + hand-eye", vis)
