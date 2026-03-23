@@ -52,9 +52,9 @@ def pixel_to_robot(pixel: Sequence[float], homography: np.ndarray) -> Tuple[floa
     return float(mapped[0]), float(mapped[1])
 
 
-def estimate_bbox_size_mm(xyxy: Sequence[float], homography: np.ndarray) -> Tuple[float, float]:
+def estimate_bbox_size_cm(xyxy: Sequence[float], homography: np.ndarray) -> Tuple[float, float]:
     """
-    Estimate planar object size (mm) from one detection box using homography.
+    Estimate planar object size (cm) from one detection box using homography.
     Assumes the target lies on the calibrated plane.
     """
     x1, y1, x2, y2 = [float(v) for v in xyxy]
@@ -68,9 +68,9 @@ def estimate_bbox_size_mm(xyxy: Sequence[float], homography: np.ndarray) -> Tupl
         dy = a[1] - b[1]
         return (dx * dx + dy * dy) ** 0.5
 
-    width_mm = 0.5 * (dist(p_tl, p_tr) + dist(p_bl, p_br))
-    height_mm = 0.5 * (dist(p_tl, p_bl) + dist(p_tr, p_br))
-    return width_mm, height_mm
+    width_cm = 0.5 * (dist(p_tl, p_tr) + dist(p_bl, p_br))
+    height_cm = 0.5 * (dist(p_tl, p_bl) + dist(p_tr, p_br))
+    return width_cm, height_cm
 
 
 def select_best_box(result, allowed: Optional[Set[str]]) -> Optional[int]:
@@ -476,20 +476,14 @@ def detection_loop(args: argparse.Namespace) -> None:
     )
 
     allowed = set(args.classes) if args.classes else None
-    target_queue: queue.Queue = queue.Queue(maxsize=1)
+    target_queue: queue.Queue = queue.Queue(maxsize=8)
     busy_flag = threading.Event()
     done_flag = threading.Event()
-    last_sent_time: Optional[float] = None
-    last_sent_xy: Optional[Tuple[float, float]] = None
-    last_sent_code: Optional[str] = None
     last_printed_code: Optional[str] = None
     last_printed_time: float = 0.0
-    confirm_frames: int = 0
-    confirm_cls_id: Optional[int] = None
-    confirm_xy: Optional[Tuple[float, float]] = None
-    confirm_code: Optional[str] = None
-    confirm_size_mm: Optional[Tuple[float, float]] = None
-    confirm_conf_threshold = max(0.7, float(args.min_pick_conf))
+    confirm_states: dict[Tuple[int, str], dict[str, object]] = {}
+    recent_sent_targets: list[Tuple[float, float, float, str]] = []
+    confirm_conf_threshold = max(0.6, float(args.min_pick_conf))
 
     robot_thread = threading.Thread(
         target=robot_worker,
@@ -532,6 +526,10 @@ def detection_loop(args: argparse.Namespace) -> None:
             if boxes is not None and len(boxes) > 0:
                 h, w = frame.shape[:2]
                 decoded_candidates = []
+                now = time.time()
+                recent_sent_targets = [
+                    item for item in recent_sent_targets if (now - item[0]) <= args.same_target_sec
+                ]
 
                 for i in range(len(boxes)):
                     cls_id = int(boxes.cls[i])
@@ -545,8 +543,8 @@ def detection_loop(args: argparse.Namespace) -> None:
                     cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 255), 2)
 
                     decoded_text: Optional[str] = None
-                    size_w_mm: Optional[float] = None
-                    size_h_mm: Optional[float] = None
+                    size_w_cm: Optional[float] = None
+                    size_h_cm: Optional[float] = None
                     x1c = max(0, min(x1, w - 1))
                     x2c = max(0, min(x2, w - 1))
                     y1c = max(0, min(y1, h - 1))
@@ -559,134 +557,130 @@ def detection_loop(args: argparse.Namespace) -> None:
                         decoded_text = decode_with_zxing(bw)
 
                         if decoded_text:
-                            size_w_mm, size_h_mm = estimate_bbox_size_mm(xyxy, homography)
+                            size_w_cm, size_h_cm = estimate_bbox_size_cm(xyxy, homography)
                             now_print = time.time()
                             if decoded_text != last_printed_code or (now_print - last_printed_time) >= 1.0:
                                 print(
-                                    f"[ZXING] {decoded_text} | size={size_w_mm:.1f}x{size_h_mm:.1f}mm",
+                                    f"[ZXING] {decoded_text} | size={size_w_cm:.1f}x{size_h_cm:.1f}cm",
                                     flush=True,
                                 )
                                 last_printed_code = decoded_text
                                 last_printed_time = now_print
 
                     box_label = f"{cls_name} {conf:.2f}"
-                    if decoded_text and size_w_mm is not None and size_h_mm is not None:
-                        box_label = f"{box_label} | {decoded_text[:32]} | {size_w_mm:.1f}x{size_h_mm:.1f}mm"
+                    if decoded_text and size_w_cm is not None and size_h_cm is not None:
+                        box_label = f"{box_label} | {decoded_text[:32]} | {size_w_cm:.1f}x{size_h_cm:.1f}cm"
                     cv2.putText(
                         vis, box_label, (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2
                     )
 
-                    if decoded_text and size_w_mm is not None and size_h_mm is not None:
+                    if decoded_text and size_w_cm is not None and size_h_cm is not None:
                         cx = float((xyxy[0] + xyxy[2]) / 2.0)
                         cy = float((xyxy[1] + xyxy[3]) / 2.0)
                         rx, ry = pixel_to_robot((cx, cy), homography)
-                        decoded_candidates.append((conf, cls_id, rx, ry, decoded_text, size_w_mm, size_h_mm))
+                        decoded_candidates.append((conf, cls_id, cls_name, rx, ry, decoded_text, size_w_cm, size_h_cm))
 
                 if decoded_candidates:
-                    decoded_candidates.sort(key=lambda item: item[0], reverse=True)
-                    conf, cls_id, rx, ry, decoded_text, size_w_mm, size_h_mm = decoded_candidates[0]
+                    high_conf_candidates = [item for item in decoded_candidates if item[0] >= confirm_conf_threshold]
 
-                    if conf >= confirm_conf_threshold:
-                        now = time.time()
-                        if (
-                            confirm_frames > 0
-                            and confirm_xy is not None
-                            and confirm_cls_id is not None
-                            and confirm_code is not None
-                            and confirm_size_mm is not None
-                        ):
-                            dx = rx - confirm_xy[0]
-                            dy = ry - confirm_xy[1]
-                            dist = (dx * dx + dy * dy) ** 0.5
-                            size_delta = max(
-                                abs(size_w_mm - confirm_size_mm[0]),
-                                abs(size_h_mm - confirm_size_mm[1]),
-                            )
-                            same_candidate = (
-                                cls_id == confirm_cls_id
-                                and decoded_text == confirm_code
-                                and dist <= args.same_target_mm
-                                and size_delta <= args.size_stable_mm
-                            )
-                        else:
+                    if high_conf_candidates:
+                        seen_keys = set()
+                        confirmed_candidates = []
+
+                        for conf, cls_id, cls_name, rx, ry, decoded_text, size_w_cm, size_h_cm in high_conf_candidates:
+                            key = (cls_id, decoded_text)
+                            seen_keys.add(key)
+                            prev_state = confirm_states.get(key)
+
                             same_candidate = False
-
-                        if same_candidate:
-                            confirm_frames += 1
-                        else:
-                            confirm_frames = 1
-
-                        confirm_cls_id = cls_id
-                        confirm_xy = (rx, ry)
-                        confirm_code = decoded_text
-                        confirm_size_mm = (size_w_mm, size_h_mm)
-
-                        if confirm_frames < args.confirm_frames:
-                            status = (
-                                f"Confirming {confirm_frames}/{args.confirm_frames} | "
-                                f"{size_w_mm:.1f}x{size_h_mm:.1f}mm"
-                            )
-                            status_color = (0, 255, 255)
-                        else:
-                            in_cooldown = last_sent_time is not None and (now - last_sent_time) < args.cooldown
-                            same_recent = False
-                            if last_sent_time is not None and last_sent_xy is not None:
-                                dt = now - last_sent_time
-                                dx = rx - last_sent_xy[0]
-                                dy = ry - last_sent_xy[1]
+                            if prev_state is not None:
+                                prev_xy = prev_state["xy"]
+                                prev_size = prev_state["size"]
+                                dx = rx - prev_xy[0]
+                                dy = ry - prev_xy[1]
                                 dist = (dx * dx + dy * dy) ** 0.5
-                                same_recent = (
-                                    dt <= args.same_target_sec
-                                    and dist <= args.same_target_mm
-                                    and last_sent_code == decoded_text
+                                size_delta = max(
+                                    abs(size_w_cm - prev_size[0]),
+                                    abs(size_h_cm - prev_size[1]),
+                                )
+                                same_candidate = (
+                                    dist <= args.same_target_mm and size_delta <= args.size_stable_cm
                                 )
 
-                            if in_cooldown:
-                                remaining_cd = args.cooldown - (now - last_sent_time)
-                                status = f"Cooldown {max(0.0, remaining_cd):.1f}s"
-                                status_color = (0, 255, 255)
-                            elif same_recent:
+                            frames = int(prev_state["frames"]) + 1 if same_candidate and prev_state is not None else 1
+                            confirm_states[key] = {
+                                "frames": frames,
+                                "xy": (rx, ry),
+                                "size": (size_w_cm, size_h_cm),
+                            }
+
+                            if frames >= args.confirm_frames:
+                                confirmed_candidates.append(
+                                    (conf, cls_id, cls_name, rx, ry, decoded_text, size_w_cm, size_h_cm)
+                                )
+
+                        confirm_states = {key: confirm_states[key] for key in seen_keys}
+
+                        if confirmed_candidates:
+                            confirmed_candidates.sort(key=lambda item: (item[6] * item[7], item[0]), reverse=True)
+                            sent_count = 0
+
+                            for candidate in confirmed_candidates:
+                                (
+                                    conf,
+                                    cls_id,
+                                    cls_name,
+                                    rx,
+                                    ry,
+                                    decoded_text,
+                                    size_w_cm,
+                                    size_h_cm,
+                                ) = candidate
+                                same_recent = False
+                                for sent_time, sent_x, sent_y, sent_code in recent_sent_targets:
+                                    dx = rx - sent_x
+                                    dy = ry - sent_y
+                                    dist = (dx * dx + dy * dy) ** 0.5
+                                    if (
+                                        sent_code == decoded_text
+                                        and (now - sent_time) <= args.same_target_sec
+                                        and dist <= args.same_target_mm
+                                    ):
+                                        same_recent = True
+                                        break
+
+                                if not same_recent:
+                                    try:
+                                        target_queue.put_nowait((rx, ry, args.pick_z, cls_id))
+                                        recent_sent_targets.append((now, rx, ry, decoded_text))
+                                        confirm_states.pop((cls_id, decoded_text), None)
+                                        sent_count += 1
+                                    except queue.Full:
+                                        status = "Queue full"
+                                        status_color = (0, 255, 255)
+                                        break
+
+                            if sent_count > 0:
+                                busy_flag.set()
+                                status = f"Targets sent {sent_count}"
+                            else:
                                 status = "Dedup skip"
                                 status_color = (0, 255, 255)
-                            else:
-                                try:
-                                    target_queue.put_nowait((rx, ry, args.pick_z, cls_id))
-                                    busy_flag.set()
-                                    last_sent_time = now
-                                    last_sent_xy = (rx, ry)
-                                    last_sent_code = decoded_text
-                                    status = "Target sent"
-                                except queue.Full:
-                                    status = "Queue full"
-                                    status_color = (0, 255, 255)
-
-                            confirm_frames = 0
-                            confirm_cls_id = None
-                            confirm_xy = None
-                            confirm_code = None
-                            confirm_size_mm = None
+                        else:
+                            max_frames = max(int(confirm_states[key]["frames"]) for key in seen_keys)
+                            status = f"Confirming {len(seen_keys)} target(s) {max_frames}/{args.confirm_frames}"
+                            status_color = (0, 255, 255)
                     else:
-                        confirm_frames = 0
-                        confirm_cls_id = None
-                        confirm_xy = None
-                        confirm_code = None
-                        confirm_size_mm = None
-                        status = f"Low conf {conf:.2f}"
+                        confirm_states.clear()
+                        best_conf = max(item[0] for item in decoded_candidates)
+                        status = f"Low conf {best_conf:.2f}"
                         status_color = (0, 255, 255)
                 else:
-                    confirm_frames = 0
-                    confirm_cls_id = None
-                    confirm_xy = None
-                    confirm_code = None
-                    confirm_size_mm = None
+                    confirm_states.clear()
                     status = "Barcode decode failed"
                     status_color = (0, 255, 255)
             else:
-                confirm_frames = 0
-                confirm_cls_id = None
-                confirm_xy = None
-                confirm_code = None
-                confirm_size_mm = None
+                confirm_states.clear()
 
             cv2.putText(vis, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
             cv2.imshow("yolo + hand-eye", vis)
@@ -709,11 +703,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cam-width", type=int, default=1280, help="Requested camera width (pixels)")
     parser.add_argument("--cam-height", type=int, default=720, help="Requested camera height (pixels)")
     parser.add_argument("--cam-fps", type=int, default=30, help="Requested camera FPS")
-    parser.add_argument("--conf", type=float, default=0.7, help="YOLO detection confidence threshold")
+    parser.add_argument("--conf", type=float, default=0.6, help="YOLO detection confidence threshold")
     parser.add_argument("--imgsz", type=int, default=640, help="YOLO inference image size")
-    parser.add_argument("--min-pick-conf", type=float, default=0.7, help="Minimum confidence to send a pick command")
+    parser.add_argument("--min-pick-conf", type=float, default=0.6, help="Minimum confidence to send a pick command")
     parser.add_argument("--confirm-frames", type=int, default=3, help="Required stable decoded frames before sending a target")
-    parser.add_argument("--size-stable-mm", type=float, default=8.0, help="Max size delta (mm) between frames to count as stable")
+    parser.add_argument(
+        "--size-stable-cm",
+        dest="size_stable_cm",
+        type=float,
+        default=8.0,
+        help="Max size delta (cm) between frames to count as stable",
+    )
     parser.add_argument("--classes", nargs="*", help="Optional class name filter for picking")
     parser.add_argument("--parms-dir", type=str, default="save_parms", help="Directory containing homography.npy")
     parser.add_argument("--z-height", type=float, default=90.0, help="Table Z height for picking (mm)")
@@ -754,11 +754,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wait-at-target", type=float, default=3.0, help="Wait at target after arriving (s)")
     parser.add_argument("--wait-after-open", type=float, default=3.0, help="Wait after gripper open (s)")
     parser.add_argument("--wait-after-close", type=float, default=3.0, help="Wait after gripper close (s)")
-    parser.add_argument("--drop-x", type=float, default=100.0, help="Drop point X (mm)")
+    parser.add_argument("--drop-x", type=float, default=-100.0, help="Drop point X (mm)")
     parser.add_argument("--drop-y", type=float, default=150.0, help="Drop point Y (mm)")
     parser.add_argument("--drop-z", type=float, default=150.0, help="Drop transfer height Z (mm)")
     parser.add_argument("--drop-release-z", type=float, default=100.0, help="Drop release height Z (mm)")
-    parser.add_argument("--post-open-lift-z", type=float, default=150.0, help="Z height after release-open before close (mm)")
+    parser.add_argument("--post-open-lift-z", type=float, default=130.0, help="Z height after release-open before close (mm)")
     parser.add_argument("--post-open-wait", type=float, default=3.0, help="Wait time after post-release lift before close (s)")
     parser.add_argument("--wait-at-drop", type=float, default=3.0, help="Wait at drop release height before release (s)")
     parser.add_argument("--cooldown", type=float, default=1.5, help="Global cooldown after sending a target (s)")
@@ -770,7 +770,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--calib-x", type=float, default=None, help="(Deprecated) alias for --home-x")
     parser.add_argument("--calib-y", type=float, default=None, help="(Deprecated) alias for --home-y")
     parser.add_argument("--calib-z", type=float, default=None, help="(Deprecated) alias for --home-z")
-    parser.add_argument("--host", type=str, default="10.149.65.232", help="Robot IP address")
+    parser.add_argument("--host", type=str, default="10.149.70.8", help="Robot IP address")
     parser.add_argument("--port", type=int, default=5000, help="Robot TCP port")
     parser.add_argument("--dry-run", action="store_true", help="Print commands instead of sending to robot")
     parser.add_argument("--skip-enable", action="store_true", help="Do not send motor enable command on connect")
