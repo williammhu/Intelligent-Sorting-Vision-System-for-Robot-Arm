@@ -128,7 +128,7 @@ def robot_worker(
     """
     Finite-state machine worker: consumes one target at a time and executes
     the move/gripper sequence without long blocking sleeps.
-    Each target is a tuple (x_mm, y_mm, z_mm, cls_id).
+    Each target is a tuple (x_mm, y_mm, z_mm, cls_id[, drop_release_z_mm]).
     """
     try:
         with FreenoveArmClient(
@@ -188,7 +188,6 @@ def robot_worker(
             print("[robot] connected to arm")
             home_point = (args.home_x, args.home_y, args.home_z)
             drop_point = (args.drop_x, args.drop_y, args.drop_z)
-            drop_release_point = (args.drop_x, args.drop_y, args.drop_release_z)
             drop_post_open_lift_point = (args.drop_x, args.drop_y, args.post_open_lift_z)
             state = "IDLE"
             command_sent = False
@@ -215,7 +214,11 @@ def robot_worker(
                     start_time = 0.0
                     continue
 
-                x, y, z, cls_id = current_target  # type: ignore[misc]
+                if len(current_target) >= 5:  # type: ignore[arg-type]
+                    x, y, z, cls_id, current_drop_release_z = current_target  # type: ignore[misc]
+                else:
+                    x, y, z, cls_id = current_target  # type: ignore[misc]
+                    current_drop_release_z = args.drop_release_z
 
                 if state == "PRE_OPEN_BEFORE_TARGET":
                     print("[robot] step=pre_open_before_target (no wait)")
@@ -334,8 +337,8 @@ def robot_worker(
 
                 if state == "MOVE_TO_DROP_RELEASE_Z":
                     if not command_sent:
-                        print(f"[robot] step=drop_descend release_z={args.drop_release_z:.1f}")
-                        arm.move_to(*drop_release_point, speed=args.speed)
+                        print(f"[robot] step=drop_descend release_z={current_drop_release_z:.1f}")
+                        arm.move_to(args.drop_x, args.drop_y, current_drop_release_z, speed=args.speed)
                         start_time = now
                         command_sent = True
                     if move_phase_done(start_time):
@@ -484,7 +487,7 @@ def detection_loop(args: argparse.Namespace) -> None:
     confirm_states: Dict[Tuple[int, str], Dict[str, Any]] = {}
     recent_sent_targets: List[Tuple[float, float, float, str]] = []
     confirm_conf_threshold = max(0.6, float(args.min_pick_conf))
-    pending_required_decode_count = 0
+    round_target_count = 0
 
     robot_thread = threading.Thread(
         target=robot_worker,
@@ -583,10 +586,8 @@ def detection_loop(args: argparse.Namespace) -> None:
                         rx, ry = pixel_to_robot((cx, cy), homography)
                         decoded_candidates.append((conf, cls_id, cls_name, rx, ry, decoded_text, size_w_cm, size_h_cm))
 
-                if detected_box_count >= 2:
-                    pending_required_decode_count = max(pending_required_decode_count, detected_box_count)
-                elif detected_box_count == 0:
-                    pending_required_decode_count = 0
+                if round_target_count == 0 and detected_box_count > 0:
+                    round_target_count = 1 if detected_box_count == 1 else 2
 
                 if decoded_candidates:
                     high_conf_candidates = [item for item in decoded_candidates if item[0] >= confirm_conf_threshold]
@@ -630,7 +631,7 @@ def detection_loop(args: argparse.Namespace) -> None:
                         confirm_states = {key: confirm_states[key] for key in seen_keys}
 
                         if confirmed_candidates:
-                            required_decode_count = pending_required_decode_count if pending_required_decode_count >= 2 else 1
+                            required_decode_count = round_target_count if round_target_count > 0 else 1
 
                             if len(confirmed_candidates) < required_decode_count:
                                 status = f"Waiting decode {len(confirmed_candidates)}/{required_decode_count}"
@@ -642,10 +643,10 @@ def detection_loop(args: argparse.Namespace) -> None:
                                 continue
 
                             confirmed_candidates.sort(key=lambda item: (item[6] * item[7], item[0]), reverse=True)
-                            sent_count = 0
                             send_limit = min(required_decode_count, len(confirmed_candidates))
+                            targets_to_send = []
 
-                            for candidate in confirmed_candidates[:send_limit]:
+                            for send_index, candidate in enumerate(confirmed_candidates[:send_limit]):
                                 (
                                     conf,
                                     cls_id,
@@ -670,47 +671,61 @@ def detection_loop(args: argparse.Namespace) -> None:
                                         break
 
                                 if not same_recent:
-                                    try:
-                                        target_queue.put_nowait((rx, ry, args.pick_z, cls_id))
+                                    drop_release_z = (
+                                        args.drop_release_z_second
+                                        if required_decode_count == 2 and send_index == 1
+                                        else args.drop_release_z
+                                    )
+                                    targets_to_send.append(
+                                        (rx, ry, args.pick_z, cls_id, drop_release_z, decoded_text)
+                                    )
+
+                            if len(targets_to_send) == required_decode_count:
+                                sent_count = 0
+                                try:
+                                    for rx, ry, pick_z, cls_id, drop_release_z, decoded_text in targets_to_send:
+                                        target_queue.put_nowait((rx, ry, pick_z, cls_id, drop_release_z))
                                         recent_sent_targets.append((now, rx, ry, decoded_text))
                                         confirm_states.pop((cls_id, decoded_text), None)
                                         sent_count += 1
-                                    except queue.Full:
-                                        status = "Queue full"
-                                        status_color = (0, 255, 255)
-                                        break
+                                except queue.Full:
+                                    status = "Queue full"
+                                    status_color = (0, 255, 255)
+                                    sent_count = 0
 
-                            if sent_count > 0:
+                            if len(targets_to_send) == required_decode_count and sent_count > 0:
                                 busy_flag.set()
                                 status = f"Targets sent {sent_count}"
-                                pending_required_decode_count = 0
+                                round_target_count = 0
+                                confirm_states.clear()
                             else:
                                 status = "Dedup skip"
                                 status_color = (0, 255, 255)
                         else:
                             max_frames = max(int(confirm_states[key]["frames"]) for key in seen_keys)
-                            if pending_required_decode_count >= 2:
-                                status = f"Waiting decode 0/{pending_required_decode_count}"
+                            if round_target_count >= 2:
+                                status = f"Waiting decode 0/{round_target_count}"
                             else:
                                 status = f"Confirming {len(seen_keys)} target(s) {max_frames}/{args.confirm_frames}"
                             status_color = (0, 255, 255)
                     else:
                         best_conf = max(item[0] for item in decoded_candidates)
-                        if pending_required_decode_count >= 2:
-                            status = f"Waiting decode 0/{pending_required_decode_count}"
+                        if round_target_count >= 2:
+                            status = f"Waiting decode 0/{round_target_count}"
                         else:
                             confirm_states.clear()
                             status = f"Low conf {best_conf:.2f}"
                         status_color = (0, 255, 255)
                 else:
-                    if pending_required_decode_count >= 2:
-                        status = f"Waiting decode 0/{pending_required_decode_count}"
+                    if round_target_count >= 2:
+                        status = f"Waiting decode 0/{round_target_count}"
                     else:
                         confirm_states.clear()
                         status = "Barcode decode failed"
                     status_color = (0, 255, 255)
             else:
                 confirm_states.clear()
+                round_target_count = 0
                 pending_required_decode_count = 0
 
             cv2.putText(vis, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
@@ -787,8 +802,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wait-after-close", type=float, default=3.0, help="Wait after gripper close (s)")
     parser.add_argument("--drop-x", type=float, default=-100.0, help="Drop point X (mm)")
     parser.add_argument("--drop-y", type=float, default=150.0, help="Drop point Y (mm)")
-    parser.add_argument("--drop-z", type=float, default=150.0, help="Drop transfer height Z (mm)")
+    parser.add_argument("--drop-z", type=float, default=160.0, help="Drop transfer height Z (mm)")
     parser.add_argument("--drop-release-z", type=float, default=100.0, help="Drop release height Z (mm)")
+    parser.add_argument(
+        "--drop-release-z-second",
+        type=float,
+        default=130.0,
+        help="Drop release height Z (mm) for the second target in a two-target round",
+    )
     parser.add_argument("--post-open-lift-z", type=float, default=130.0, help="Z height after release-open before close (mm)")
     parser.add_argument("--post-open-wait", type=float, default=3.0, help="Wait time after post-release lift before close (s)")
     parser.add_argument("--wait-at-drop", type=float, default=3.0, help="Wait at drop release height before release (s)")
